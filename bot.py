@@ -1,220 +1,192 @@
 import os
 import asyncio
 import logging
-import aiosqlite
-from datetime import datetime
-from typing import Callable, Awaitable, Dict, Any
-
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.client.default import DefaultBotProperties
-from aiogram import BaseMiddleware
-
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient
-from telethon.errors import (
-    PhoneNumberBannedError, UserDeactivatedBanError,
-    FloodWaitError, UserBannedInChannelError
-)
-from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import GetDialogsRequest
-from telethon.tl.types import InputPeerEmpty
+from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser
+from telethon.errors.rpcerrorlist import PeerFloodError, UserPrivacyRestrictedError
+import csv
+import random
+import time
 
-# ================== CONFIG ==================
+# --- Configuration ---
 API_ID = 25781839
 API_HASH = "20a3f2f168739259a180dcdd642e196c"
 BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqwfRpVCW6wOFc"
 ADMIN_IDS = [7584086775]
+SESSION_DIR = "sessions"
 
-SESSION_FOLDER = 'sessions'
-DB_FILE = 'scraped_users.db'
-# ============================================
+# --- Logging Setup ---
+os.makedirs(SESSION_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+# --- Aiogram Setup ---
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
-SOURCE_GROUPS = set()
-TARGET_GROUPS = set()
-VALID_SESSIONS = []
-DEAD_SESSIONS = []
+# --- Utilities ---
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-# ================== MIDDLEWARE ==================
-class AdminOnlyMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[types.Update, Dict[str, Any]], Awaitable[Any]],
-        event: types.Update,
-        data: Dict[str, Any]
-    ) -> Any:
-        user = event.message.from_user if event.message else event.callback_query.from_user
-        if user.id not in ADMIN_IDS:
-            text = "This is a private bot."
-            if event.message:
-                await event.message.answer(text)
-            elif event.callback_query:
-                await event.callback_query.message.edit_text(text)
-            return
-        return await handler(event, data)
+async def save_session_file(file: types.Document) -> str:
+    file_path = os.path.join(SESSION_DIR, file.file_name)
+    await file.download(destination=file_path)
+    return file_path
 
-dp.update.outer_middleware(AdminOnlyMiddleware())
+async def validate_telethon_session(session_path: str) -> bool:
+    try:
+        session_name = os.path.splitext(os.path.basename(session_path))[0]
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        await client.connect()
+        authorized = await client.is_user_authorized()
+        await client.disconnect()
+        return authorized
+    except Exception as e:
+        logging.error(f"Validation failed for {session_path}: {e}")
+        return False
 
-# ================== DATABASE ==================
-async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER,
-            username TEXT,
-            group_id INTEGER,
-            group_name TEXT,
-            date_scraped TEXT
-        )''')
-        await db.commit()
+def list_sessions() -> list[str]:
+    return [f for f in os.listdir(SESSION_DIR) if f.endswith(".session")]
 
-# ================== SESSION MANAGEMENT ==================
-async def load_sessions():
-    global VALID_SESSIONS, DEAD_SESSIONS
-    VALID_SESSIONS.clear()
-    DEAD_SESSIONS.clear()
+async def scrape_members(client, group) -> list:
+    members = []
+    async for user in client.get_participants(group):
+        members.append(user)
+    return members
 
-    for file in os.listdir(SESSION_FOLDER):
-        if file.endswith(".session"):
-            path = os.path.join(SESSION_FOLDER, file)
-            client = TelegramClient(path, API_ID, API_HASH)
-            try:
-                await client.connect()
-                if not await client.is_user_authorized():
-                    raise Exception("Not logged in")
-                await client.get_me()
-                VALID_SESSIONS.append((file, client))
-            except (PhoneNumberBannedError, UserDeactivatedBanError, Exception):
-                DEAD_SESSIONS.append(file)
-
-def remove_dead_sessions():
-    removed = 0
-    for f in DEAD_SESSIONS:
+async def add_members_to_group(client, target_group, users, mode=1):
+    target_group_entity = InputPeerChannel(target_group.id, target_group.access_hash)
+    n = 0
+    for user in users:
         try:
-            os.remove(os.path.join(SESSION_FOLDER, f))
-            os.remove(os.path.join(SESSION_FOLDER, f + ".session-journal"))
-            removed += 1
-        except:
+            if mode == 1 and user.username:
+                user_to_add = await client.get_input_entity(user.username)
+            elif mode == 2:
+                user_to_add = InputPeerUser(user.id, user.access_hash)
+            else:
+                continue
+            await client(InviteToChannelRequest(target_group_entity, [user_to_add]))
+            n += 1
+            logging.info(f"Added {user.username if user.username else user.id}")
+            if n % 80 == 0:  # Wait to avoid flood
+                time.sleep(random.randint(60, 180))
+        except PeerFloodError:
+            logging.warning(f"Flood error while adding {user.username if user.username else user.id}. Stopping.")
+            break
+        except UserPrivacyRestrictedError:
+            logging.warning(f"Privacy restrictions for {user.username if user.username else user.id}. Skipping.")
             continue
-    return removed
-
-# ================== SCRAPER ==================
-async def scrape_users():
-    await init_db()
-    for name, client in VALID_SESSIONS:
-        try:
-            dialogs = await client(GetDialogsRequest(
-                offset_date=None, offset_id=0, offset_peer=InputPeerEmpty(),
-                limit=100, hash=0
-            ))
-            for group in dialogs.chats:
-                if group.id not in SOURCE_GROUPS:
-                    continue
-                async for user in client.iter_participants(group):
-                    if user.username:
-                        async with aiosqlite.connect(DB_FILE) as db:
-                            await db.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?)",
-                                (user.id, user.username, group.id, group.title, datetime.utcnow().isoformat()))
-                            await db.commit()
         except Exception as e:
-            print(f"[SCRAPER ERROR] {name}: {e}")
+            logging.error(f"Error adding {user.username if user.username else user.id}: {e}")
+            continue
 
-# ================== AUTO JOIN ==================
-async def auto_join():
-    for name, client in VALID_SESSIONS:
-        try:
-            for group in TARGET_GROUPS:
-                try:
-                    await client(JoinChannelRequest(group))
-                    await asyncio.sleep(2)
-                except (FloodWaitError, UserBannedInChannelError):
-                    continue
-        except Exception as e:
-            print(f"[JOIN ERROR] {name}: {e}")
+# --- Commands ---
+@router.message(F.text == "/start")
+async def cmd_start(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ You are not authorized to use this bot.")
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="Upload Sessions", callback_data="upload_sessions")
+    keyboard.button(text="List Sessions", callback_data="list_sessions")
+    keyboard.button(text="Scrape Members", callback_data="scrape_members")
+    keyboard.button(text="Add Members", callback_data="add_members")
+    await message.answer("Welcome, Admin! Choose an action:", reply_markup=keyboard.as_markup())
 
-# ================== INLINE KEYBOARD ==================
-def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Start Scraping", callback_data="start_scraping"),
-         InlineKeyboardButton(text="Start Auto-Join", callback_data="start_join")],
-        [InlineKeyboardButton(text="Session Stats", callback_data="stats"),
-         InlineKeyboardButton(text="Clean Dead Sessions", callback_data="clean_sessions")],
-        [InlineKeyboardButton(text="How to Add Sessions", callback_data="add_sessions_help")]
-    ])
+@router.callback_query(F.data == "upload_sessions")
+async def prompt_upload_sessions(callback: CallbackQuery):
+    await callback.message.answer("Please upload `.session` files (one by one).")
+    await callback.answer()
 
-# ================== HANDLERS ==================
-@dp.message(CommandStart())
-async def start_cmd(msg: types.Message):
-    await msg.answer("Welcome to your private Telegram Member Scraper Bot!", reply_markup=main_menu())
+@router.callback_query(F.data == "list_sessions")
+async def list_uploaded_sessions(callback: CallbackQuery):
+    sessions = list_sessions()
+    if not sessions:
+        await callback.message.answer("No sessions uploaded yet.")
+    else:
+        msg = "<b>Uploaded Sessions:</b>\n" + "\n".join([f"• <code>{s}</code>" for s in sessions])
+        await callback.message.answer(msg)
+    await callback.answer()
 
-@dp.callback_query(F.data == "start_scraping")
-async def start_scraping(call: types.CallbackQuery):
-    await call.message.edit_text("Starting to scrape users...")
-    await load_sessions()
-    await scrape_users()
-    await call.message.edit_text("Scraping finished.", reply_markup=main_menu())
+@router.callback_query(F.data == "scrape_members")
+async def scrape_members_callback(callback: CallbackQuery):
+    await callback.message.answer("Please upload a session file to start scraping members.")
+    await callback.answer()
 
-@dp.callback_query(F.data == "start_join")
-async def start_join(call: types.CallbackQuery):
-    await call.message.edit_text("Joining groups...")
-    await load_sessions()
-    await auto_join()
-    await call.message.edit_text("All sessions finished joining.", reply_markup=main_menu())
+@router.callback_query(F.data == "add_members")
+async def add_members_callback(callback: CallbackQuery):
+    await callback.message.answer("Please upload a session file and CSV of users to add.")
+    await callback.answer()
 
-@dp.callback_query(F.data == "stats")
-async def show_stats(call: types.CallbackQuery):
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            count = (await cur.fetchone())[0]
-    await call.message.edit_text(
-        f"✅ Valid Sessions: {len(VALID_SESSIONS)}\n"
-        f"❌ Dead Sessions: {len(DEAD_SESSIONS)}\n"
-        f"📦 Scraped Users: {count}",
-        reply_markup=main_menu()
-    )
-
-@dp.callback_query(F.data == "clean_sessions")
-async def clean_sessions(call: types.CallbackQuery):
-    removed = remove_dead_sessions()
-    await call.message.edit_text(f"Removed {removed} dead sessions.", reply_markup=main_menu())
-
-@dp.callback_query(F.data == "add_sessions_help")
-async def add_sessions_help(call: types.CallbackQuery):
-    await call.message.edit_text(
-        "To add sessions:\n"
-        "1. Use a Telethon login script to log in accounts.\n"
-        "2. Place `.session` files in the `sessions/` folder.\n"
-        "3. Use inline buttons to start scraping or auto-join.",
-        reply_markup=main_menu()
-    )
-
-@dp.message(Command("add_source"))
-async def add_source_group(msg: types.Message):
+@router.message(F.document)
+async def handle_document_upload(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Unauthorized.")
+    
+    doc = message.document
+    if not doc.file_name.endswith(".session"):
+        return await message.answer("Please upload a valid <b>.session</b> file.")
+    
     try:
-        gid = int(msg.text.split(maxsplit=1)[1])
-        SOURCE_GROUPS.add(gid)
-        await msg.reply(f"Added source group ID: {gid}")
-    except:
-        await msg.reply("Usage: /add_source <group_id>")
+        saved_path = await save_session_file(doc)
+        is_valid = await validate_telethon_session(saved_path)
+        if is_valid:
+            await message.answer(f"✅ <b>{doc.file_name}</b> is valid and saved.")
+        else:
+            os.remove(saved_path)
+            await message.answer(f"❌ <b>{doc.file_name}</b> is invalid or unauthorized.")
+    except Exception as e:
+        logging.exception("Failed to handle document upload:")
+        await message.answer("❌ An error occurred while processing your file.")
 
-@dp.message(Command("add_target"))
-async def add_target_group(msg: types.Message):
+@router.message(F.text == "/scrape_members")
+async def cmd_scrape_members(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Unauthorized.")
+    
+    # You can replace this part with a more complex group selection if needed
+    await message.answer("Please provide a group link or username to scrape members.")
+    
+@router.message(F.text)
+async def scrape_members_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Unauthorized.")
+    
+    group = message.text
     try:
-        username = msg.text.split(maxsplit=1)[1]
-        TARGET_GROUPS.add(username)
-        await msg.reply(f"Added target group: {username}")
-    except:
-        await msg.reply("Usage: /add_target <@group_username>")
+        # Get group
+        client = TelegramClient('temp', API_ID, API_HASH)
+        await client.start()
+        group_entity = await client.get_entity(group)
+        
+        # Scrape members
+        members = await scrape_members(client, group_entity)
+        await client.disconnect()
+        
+        # Save to CSV
+        with open("scraped_members.csv", "w", newline="", encoding="UTF-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(['username', 'user_id', 'access_hash', 'name'])
+            for user in members:
+                writer.writerow([user.username, user.id, user.access_hash, user.full_name])
 
-# ================== MAIN ==================
+        await message.answer("Members scraped successfully and saved to 'scraped_members.csv'.")
+    except Exception as e:
+        logging.error(f"Failed to scrape members: {e}")
+        await message.answer("❌ Failed to scrape members. Check the logs.")
+
+# --- Bot Entry ---
 async def main():
-    logging.basicConfig(level=logging.INFO)
-    os.makedirs(SESSION_FOLDER, exist_ok=True)
-    await init_db()
+    logging.info("Bot is starting...")
     await dp.start_polling(bot)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
