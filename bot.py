@@ -34,14 +34,14 @@ HISTORY_LIMIT = 20
 STALL_TIMEOUT = 300
 ARIA2_RPC_PORT = 6800
 YTS_API_URL = "https://yts.mx/api/v2/list_movies.json"
-DEFAULT_ENGINE = "libtorrent"  # Default to libtorrent
+DEFAULT_ENGINE = "libtorrent"
 
 # Hacker aesthetic
-HACKER_PREFIX = "💾 [CYBERLINK v4.0] "
+HACKER_PREFIX = "💾 [CYBERLINK v4.1] "
 HACKER_FOOTER = "🔒 SECURE TRANSMISSION ENDED"
 ASCII_ART = """
    ╔════════════════════════════════════╗
-   ║  CYBERLINK TORRENT MATRIX v4.0     ║
+   ║  CYBERLINK TORRENT MATRIX v4.1     ║
    ║  INITIALIZING HACKER PROTOCOL...   ║
    ╚════════════════════════════════════╝
 """
@@ -59,8 +59,16 @@ logger = logging.getLogger(__name__)
 
 # Initialize libtorrent
 try:
-    ses = lt.session()
-    ses.listen_on(6881, 6891)
+    settings = {
+        'listen_interfaces': '0.0.0.0:6881',
+        'outgoing_interfaces': '',
+        'allow_multiple_connections_per_ip': True,
+        'enable_dht': True,
+        'enable_lsd': True,
+        'enable_upnp': True,
+        'enable_natpmp': True
+    }
+    ses = lt.session(settings)
 except Exception as e:
     logger.error(f"Failed to initialize libtorrent: {e}")
     ses = None
@@ -97,7 +105,7 @@ user_requests = defaultdict(list)
 user_history = defaultdict(list)
 download_start_times = {}
 torrent_names = {}
-user_engines = defaultdict(lambda: DEFAULT_ENGINE)  # Per-user engine preference
+user_engines = defaultdict(lambda: DEFAULT_ENGINE)
 
 # Ensure download directory exists
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -299,7 +307,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     history_text = f"{HACKER_PREFIX}DOWNLOAD ARCHIVES\n"
     for idx, item in enumerate(user_history[user_id], 1):
-        history_text += f"[{idx}] {item['name']} ({item['time']})\n"
+        history_text += f"[{idx}] {item['name']} ({item['time']}, {item['engine']})\n"
     await update.message.reply_text(
         f"```\n{ASCII_ART}\n```\n{history_text}{HACKER_FOOTER}",
         parse_mode="Markdown"
