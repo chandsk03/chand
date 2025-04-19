@@ -1,1030 +1,864 @@
-#!/usr/bin/env python3
-"""
-Advanced Telegram Member Management Bot (Complete Implementation)
-Version: 4.0
-Features:
-- Session management with validation
-- Member scraping with progress tracking
-- Member adding with flood control
-- CSV import/export
-- Admin controls
-- Rate limiting
-- Error handling
-"""
-
 import os
-import sys
-import asyncio
 import logging
-import random
+import telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from datetime import datetime, timedelta
+import asyncio
+import re
+import requests
+import shutil
+from collections import defaultdict
 import time
-import csv
+from dotenv import load_dotenv
 import signal
-import atexit
-import socket
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Any, Union
-from enum import Enum, auto
+import sys
+import libtorrent as lt
+import aria2p
+import subprocess
 
-from aiogram import Bot, Dispatcher, F, Router, types
-from aiogram.enums import ParseMode, ChatType
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    FSInputFile,
-    Document,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton
+# Load environment variables
+load_dotenv()
+
+# Configuration
+API_ID = int(os.getenv("API_ID", "25781839"))
+API_HASH = os.getenv("API_HASH", "20a3f2f168739259a180dcdd642e196c")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7614305417:AAFjptKmdgPUN0aeiRSRqNUm2l7KhHj0aFc")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "7584086775").split(",")]
+ARIA2_SECRET = os.getenv("ARIA2_SECRET", "mysecret")
+DOWNLOAD_DIR = "downloads"
+MAX_CONCURRENT = 3
+RATE_LIMIT_SECONDS = 60
+RATE_LIMIT_REQUESTS = 10
+HISTORY_LIMIT = 20
+STALL_TIMEOUT = 300
+ARIA2_RPC_PORT = 6800
+YTS_API_URL = "https://yts.mx/api/v2/list_movies.json"
+DEFAULT_ENGINE = "libtorrent"  # Default to libtorrent
+
+# Hacker aesthetic
+HACKER_PREFIX = "💾 [CYBERLINK v4.0] "
+HACKER_FOOTER = "🔒 SECURE TRANSMISSION ENDED"
+ASCII_ART = """
+   ╔════════════════════════════════════╗
+   ║  CYBERLINK TORRENT MATRIX v4.0     ║
+   ║  INITIALIZING HACKER PROTOCOL...   ║
+   ╚════════════════════════════════════╝
+"""
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.default import DefaultBotProperties
-from aiogram.utils.rate_limiter import RateLimiter, DefaultRateLimiter
-from aiogram.utils.chat_action import ChatActionSender
+logger = logging.getLogger(__name__)
 
-from telethon import TelegramClient, functions, errors
-from telethon.tl import types as tl_types
-from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.tl.types import (
-    InputPeerUser,
-    InputPeerChannel,
-    InputPeerChat,
-    User,
-    Channel,
-    Chat
-)
-from telethon.errors import (
-    PeerFloodError,
-    UserPrivacyRestrictedError,
-    FloodWaitError,
-    ChannelPrivateError,
-    UserNotMutualContactError,
-    SessionPasswordNeededError
-)
+# Initialize libtorrent
+try:
+    ses = lt.session()
+    ses.listen_on(6881, 6891)
+except Exception as e:
+    logger.error(f"Failed to initialize libtorrent: {e}")
+    ses = None
 
-# ==================== CONFIGURATION ====================
-class Config:
-    # Telegram API credentials
-    API_ID = 25781839
-    API_HASH = "20a3f2f168739259a180dcdd642e196c"
-    BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqwfRpVCW6wOFc"
-    
-    # Admin controls
-    ADMIN_IDS = [7584086775]
-    RESTRICT_MODE = True
-    
-    # Filesystem
-    SESSION_DIR = "sessions"
-    DATA_DIR = "data"
-    LOG_FILE = "bot.log"
-    PID_FILE = "/tmp/telegram_bot.pid"
-    
-    # Operation limits
-    MAX_ADD_PER_SESSION = 80
-    DELAY_BETWEEN_ADDS = (30, 60)  # seconds
-    SCRAPE_LIMIT = 10000
-    MAX_RETRIES = 5
-    REQUEST_TIMEOUT = 30
-    RATE_LIMIT = 5  # messages per second
-    
-    # UI Settings
-    PROGRESS_UPDATE_INTERVAL = 10  # seconds
-    BATCH_SIZE = 50  # members per progress update
-
-# ==================== SETUP ====================
-os.makedirs(Config.SESSION_DIR, exist_ok=True)
-os.makedirs(Config.DATA_DIR, exist_ok=True)
-
-# ==================== LOGGING ====================
-class CustomFormatter(logging.Formatter):
-    """Custom log formatter with colors"""
-    grey = "\x1b[38;20m"
-    yellow = "\x1b[33;20m"
-    red = "\x1b[31;20m"
-    bold_red = "\x1b[31;1m"
-    reset = "\x1b[0m"
-    format_str = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-
-    FORMATS = {
-        logging.DEBUG: grey + format_str + reset,
-        logging.INFO: grey + format_str + reset,
-        logging.WARNING: yellow + format_str + reset,
-        logging.ERROR: red + format_str + reset,
-        logging.CRITICAL: bold_red + format_str + reset
-    }
-
-    def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
-        formatter = logging.Formatter(log_fmt)
-        return formatter.format(record)
-
-logger = logging.getLogger("TelegramBot")
-logger.setLevel(logging.INFO)
-
-# Console handler with colors
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(CustomFormatter())
-logger.addHandler(console_handler)
-
-# File handler
-file_handler = logging.FileHandler(os.path.join(Config.DATA_DIR, Config.LOG_FILE))
-file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-logger.addHandler(file_handler)
-
-# ==================== PID MANAGEMENT ====================
-class PidManager:
-    """Prevent multiple bot instances"""
-    def __init__(self, pidfile):
-        self.pidfile = pidfile
-        
-    def __enter__(self):
-        if os.path.exists(self.pidfile):
-            with open(self.pidfile, 'r') as f:
-                pid = f.read().strip()
-            raise RuntimeError(f"Bot already running with PID {pid}")
-            
-        with open(self.pidfile, 'w') as f:
-            f.write(str(os.getpid()))
-        return self
-        
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            os.remove(self.pidfile)
-        except OSError:
-            pass
-
-# ==================== STATE MANAGEMENT ====================
-class BotState(StatesGroup):
-    """FSM states for bot operations"""
-    MAIN_MENU = State()
-    UPLOAD_SESSION = State()
-    LIST_SESSIONS = State()
-    SCRAPE_MEMBERS_INPUT = State()
-    SCRAPE_MEMBERS_PROGRESS = State()
-    ADD_MEMBERS_INPUT_GROUP = State()
-    ADD_MEMBERS_INPUT_FILE = State()
-    ADD_MEMBERS_PROGRESS = State()
-    CONFIRM_ACTION = State()
-
-# ==================== DATA MODELS ====================
-class Member:
-    """Represents a Telegram member/user"""
-    def __init__(
-        self,
-        user_id: int,
-        username: Optional[str] = None,
-        access_hash: Optional[int] = None,
-        name: Optional[str] = None,
-        phone: Optional[str] = None
-    ):
-        self.user_id = user_id
-        self.username = username
-        self.access_hash = access_hash
-        self.name = name
-        self.phone = phone
-        
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for CSV storage"""
-        return {
-            'user_id': self.user_id,
-            'username': self.username,
-            'access_hash': self.access_hash,
-            'name': self.name,
-            'phone': self.phone
-        }
-        
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'Member':
-        """Create from dictionary"""
-        return cls(
-            user_id=data.get('user_id'),
-            username=data.get('username'),
-            access_hash=data.get('access_hash'),
-            name=data.get('name'),
-            phone=data.get('phone')
+# Initialize aria2c
+try:
+    aria2_process = subprocess.Popen([
+        "aria2c",
+        "--enable-rpc",
+        f"--rpc-listen-port={ARIA2_RPC_PORT}",
+        f"--rpc-secret={ARIA2_SECRET}",
+        f"--dir={DOWNLOAD_DIR}",
+        "--daemon=false",
+        "--quiet"
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(1)
+    aria2 = aria2p.API(
+        aria2p.Client(
+            host="http://localhost",
+            port=ARIA2_RPC_PORT,
+            secret=ARIA2_SECRET
         )
-
-class OperationStatus(Enum):
-    """Status of ongoing operations"""
-    PENDING = auto()
-    RUNNING = auto()
-    COMPLETED = auto()
-    FAILED = auto()
-    CANCELLED = auto()
-
-class OngoingOperation:
-    """Tracks ongoing operations"""
-    def __init__(self, op_type: str, user_id: int):
-        self.op_type = op_type
-        self.user_id = user_id
-        self.status = OperationStatus.PENDING
-        self.start_time = datetime.now()
-        self.end_time = None
-        self.progress = 0
-        self.total = 0
-        self.message_id = None
-        
-    def update_progress(self, current: int, total: int):
-        """Update operation progress"""
-        self.progress = current
-        self.total = total
-        if current >= total:
-            self.status = OperationStatus.COMPLETED
-            self.end_time = datetime.now()
-            
-    def mark_failed(self):
-        """Mark operation as failed"""
-        self.status = OperationStatus.FAILED
-        self.end_time = datetime.now()
-        
-    def mark_cancelled(self):
-        """Mark operation as cancelled"""
-        self.status = OperationStatus.CANCELLED
-        self.end_time = datetime.now()
-
-# ==================== BOT SETUP ====================
-storage = MemoryStorage()
-bot = Bot(
-    token=Config.BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher(storage=storage)
-router = Router()
-dp.include_router(router)
-
-# Rate limiting
-rate_limiter = DefaultRateLimiter(
-    limit=Config.RATE_LIMIT,
-    interval=1.0,
-    retry_after=0.5
-)
-dp.message.middleware(rate_limiter)
-
-# ==================== UTILITIES ====================
-def is_admin(user_id: int) -> bool:
-    """Check if user is admin"""
-    return not Config.RESTRICT_MODE or user_id in Config.ADMIN_IDS
-
-async def validate_session(session_path: str) -> bool:
-    """Validate Telethon session"""
-    try:
-        async with TelegramClient(
-            session_path,
-            Config.API_ID,
-            Config.API_HASH,
-            timeout=Config.REQUEST_TIMEOUT
-        ) as client:
-            return await client.is_user_authorized()
-    except SessionPasswordNeededError:
-        logger.warning(f"Session {session_path} requires 2FA password")
-        return False
-    except Exception as e:
-        logger.error(f"Session validation failed: {str(e)}")
-        return False
-
-async def get_entity_safe(client: TelegramClient, identifier: str) -> Any:
-    """Safely get entity with retries"""
-    for attempt in range(Config.MAX_RETRIES):
-        try:
-            return await client.get_entity(identifier)
-        except ValueError as e:
-            if "Cannot find any entity" in str(e):
-                raise
-            logger.warning(f"Retry {attempt + 1} for get_entity")
-            await asyncio.sleep(1)
-    raise ValueError(f"Failed to resolve entity: {identifier}")
-
-async def save_members_csv(members: List[Member], filename: str) -> str:
-    """Save members to CSV with error handling"""
-    filepath = os.path.join(Config.DATA_DIR, filename)
-    try:
-        with open(filepath, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=Member(0).to_dict().keys())
-            writer.writeheader()
-            for member in members:
-                writer.writerow(member.to_dict())
-        return filepath
-    except Exception as e:
-        logger.error(f"CSV save failed: {str(e)}")
-        raise
-
-async def load_members_csv(filename: str) -> List[Member]:
-    """Load members from CSV"""
-    filepath = os.path.join(Config.DATA_DIR, filename)
-    members = []
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                members.append(Member.from_dict(row))
-        return members
-    except Exception as e:
-        logger.error(f"CSV load failed: {str(e)}")
-        raise
-
-async def get_active_sessions() -> List[str]:
-    """Get list of valid session files"""
-    sessions = []
-    for filename in os.listdir(Config.SESSION_DIR):
-        if filename.endswith('.session'):
-            session_path = os.path.join(Config.SESSION_DIR, filename)
-            if await validate_session(session_path):
-                sessions.append(filename)
-    return sessions
-
-# ==================== KEYBOARDS ====================
-def main_menu_kb() -> InlineKeyboardMarkup:
-    """Main menu keyboard"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📤 Upload Session", callback_data="upload_session")
-    builder.button(text="📋 List Sessions", callback_data="list_sessions")
-    builder.button(text="🔍 Scrape Members", callback_data="scrape_members")
-    builder.button(text="➕ Add Members", callback_data="add_members")
-    builder.button(text="📊 Stats", callback_data="bot_stats")
-    builder.button(text="⚙️ Settings", callback_data="bot_settings")
-    builder.adjust(2, 2, 2)
-    return builder.as_markup()
-
-def cancel_kb() -> InlineKeyboardMarkup:
-    """Cancel operation keyboard"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="❌ Cancel", callback_data="cancel_op")
-    return builder.as_markup()
-
-def confirm_kb() -> InlineKeyboardMarkup:
-    """Confirmation keyboard"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Confirm", callback_data="confirm_yes")
-    builder.button(text="❌ Cancel", callback_data="confirm_no")
-    return builder.as_markup()
-
-def session_selection_kb(sessions: List[str]) -> InlineKeyboardMarkup:
-    """Session selection keyboard"""
-    builder = InlineKeyboardBuilder()
-    for session in sessions:
-        builder.button(text=f"📁 {session}", callback_data=f"select_session:{session}")
-    builder.button(text="🔙 Back", callback_data="back_to_main")
-    builder.adjust(1)
-    return builder.as_markup()
-
-# ==================== HANDLERS ====================
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    """Handle /start command"""
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Unauthorized access.")
-        return
-        
-    await message.answer(
-        "👨‍💻 <b>Telegram Member Manager</b>\n\n"
-        "Choose an action:",
-        reply_markup=main_menu_kb()
     )
+except Exception as e:
+    logger.error(f"Failed to initialize aria2c: {e}")
+    aria2 = None
+    aria2_process = None
 
-@router.callback_query(F.data == "upload_session")
-async def upload_session(callback: CallbackQuery, state: FSMContext):
-    """Handle session upload request"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    await state.set_state(BotState.UPLOAD_SESSION)
-    await callback.message.edit_text(
-        "📤 <b>Upload Session File</b>\n\n"
-        "Please send your <code>.session</code> file.",
-        reply_markup=cancel_kb()
-    )
-    await callback.answer()
+# State
+downloads = []
+download_queue = []
+user_downloads = defaultdict(list)
+user_requests = defaultdict(list)
+user_history = defaultdict(list)
+download_start_times = {}
+torrent_names = {}
+user_engines = defaultdict(lambda: DEFAULT_ENGINE)  # Per-user engine preference
 
-@router.message(BotState.UPLOAD_SESSION, F.document)
-async def handle_session_upload(message: Message, state: FSMContext):
-    """Process uploaded session file"""
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Unauthorized access.")
-        return
-        
-    if not message.document.file_name.endswith('.session'):
-        await message.answer(
-            "❌ Invalid file type. Please upload a <code>.session</code> file.",
-            reply_markup=cancel_kb()
-        )
-        return
-        
+# Ensure download directory exists
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+async def send_file(update: Update, file_path: str, context: ContextTypes.DEFAULT_TYPE):
+    """Send file to user if within Telegram's 2GB limit."""
     try:
-        # Save the session file
-        session_path = await save_session_file(message.document)
-        
-        # Validate the session
-        async with ChatActionSender.upload_document(bot=bot, chat_id=message.chat.id):
-            is_valid = await validate_session(session_path)
-            
-        if is_valid:
-            await message.answer(
-                f"✅ Session <code>{message.document.file_name}</code> is valid and saved.",
-                reply_markup=main_menu_kb()
+        file_size = os.path.getsize(file_path)
+        if file_size > 2 * 1024 * 1024 * 1024:
+            await update.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: File exceeds Telegram's 2GB limit.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
             )
+            return
+        with open(file_path, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                caption=f"📽️ {os.path.basename(file_path)}",
+                parse_mode="Markdown"
+            )
+        logger.info(f"Sent file {file_path} to user {update.effective_user.id}")
+    except Exception as e:
+        logger.error(f"Error sending file {file_path}: {e}")
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: Failed to send file: {str(e)}\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+
+async def rate_limit_check(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is within rate limits."""
+    now = time.time()
+    user_requests[user_id] = [t for t in user_requests[user_id] if now - t < RATE_LIMIT_SECONDS]
+    if len(user_requests[user_id]) >= RATE_LIMIT_REQUESTS:
+        logger.warning(f"Rate limit exceeded for user {user_id}")
+        await notify_admins(context, f"User {user_id} exceeded rate limit.")
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"{HACKER_PREFIX}ALERT: Rate limit exceeded. Retry later.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return False
+    user_requests[user_id].append(now)
+    return True
+
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, message: str):
+    """Notify admins of suspicious activity."""
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"🚨 [ADMIN ALERT] {message}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin {admin_id}: {e}")
+
+async def log_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log user IP for security monitoring."""
+    user_id = update.effective_user.id
+    logger.info(f"Action by user {user_id} from IP: Unknown (Telegram API limitation)")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    await update.message.reply_text(
+        f"```\n{ASCII_ART}\n```\n"
+        f"{HACKER_PREFIX}WELCOME TO CYBERLINK TORRENT MATRIX\n"
+        "🌐 Upload magnet links or .torrent files to initiate download protocols.\n"
+        "📡 Use /search to locate movie torrents.\n"
+        "⚙️ Select engine with /engine [libtorrent|aria2c].\n"
+        "📚 Commands: /help, /status, /pause, /resume, /cancel, /history, /health\n"
+        f"{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    await update.message.reply_text(
+        f"```\n{ASCII_ART}\n```\n"
+        f"{HACKER_PREFIX}CYBERLINK COMMAND MATRIX\n"
+        "📟 /start - Initialize the matrix\n"
+        "📚 /help - Display this protocol\n"
+        "📡 /search - Scan for movie torrents\n"
+        "⚙️ /engine - Switch download engine\n"
+        "📊 /status - Monitor active streams\n"
+        "⏸️ /pause - Suspend download stream\n"
+        "▶️ /resume - Reactivate download stream\n"
+        "🛑 /cancel - Terminate download stream\n"
+        "📜 /history - Access download archives\n"
+        "🔍 /health - Analyze torrent health\n"
+        "📥 Send magnet links or .torrent files to engage.\n"
+        f"{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /engine command to switch download engine."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}Current engine: {user_engines[user_id]}\n"
+            f"Usage: /engine [libtorrent|aria2c]\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    engine = context.args[0].lower()
+    if engine not in ["libtorrent", "aria2c"]:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: Invalid engine. Use 'libtorrent' or 'aria2c'.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    if engine == "libtorrent" and ses is None:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: libtorrent unavailable.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    if engine == "aria2c" and aria2 is None:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: aria2c unavailable.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    user_engines[user_id] = engine
+    await update.message.reply_text(
+        f"{HACKER_PREFIX}Engine switched to {engine}.\n{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def search_torrents(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /search command for movie torrents."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: Provide a movie title (e.g., /search Matrix).\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    query = " ".join(context.args)
+    try:
+        response = requests.get(YTS_API_URL, params={"query_term": query, "limit": 5})
+        response.raise_for_status()
+        data = response.json()
+        movies = data.get("data", {}).get("movies", [])
+        if not movies:
+            await update.message.reply_text(
+                f"{HACKER_PREFIX}SCAN COMPLETE: No torrents found for '{query}'.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            return
+        keyboard = []
+        for movie in movies:
+            title = movie["title"]
+            year = movie["year"]
+            for torrent in movie["torrents"]:
+                quality = torrent["quality"]
+                magnet = torrent["url"].replace("torrent://", "magnet:?")
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{title} ({year}, {quality})",
+                        callback_data=f"magnet_{magnet}"
+                    )
+                ])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}TORRENT SCAN RESULTS FOR '{query}'\nSelect a stream:\n{HACKER_FOOTER}",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error searching torrents for '{query}': {e}")
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: Torrent scan failed: {str(e)}\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /history command."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    user_id = update.effective_user.id
+    if not user_history[user_id]:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ARCHIVES: No download history.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    history_text = f"{HACKER_PREFIX}DOWNLOAD ARCHIVES\n"
+    for idx, item in enumerate(user_history[user_id], 1):
+        history_text += f"[{idx}] {item['name']} ({item['time']})\n"
+    await update.message.reply_text(
+        f"```\n{ASCII_ART}\n```\n{history_text}{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    user_id = update.effective_user.id
+    if user_id not in user_downloads or not user_downloads[user_id]:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}STATUS: No active streams.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    status_text = f"{HACKER_PREFIX}ACTIVE STREAMS\n"
+    for download in user_downloads[user_id]:
+        try:
+            if isinstance(download, lt.torrent_handle):
+                status = download.status()
+                progress = status.progress * 100
+                speed = status.download_rate / 1024
+                eta = (status.total_wanted - status.total_wanted_done) / (status.download_rate + 1)
+                name = status.name
+                status_text += (
+                    f"📦 {name} (libtorrent)\n"
+                    f"  Progress: {progress:.2f}%\n"
+                    f"  Speed: {speed:.2f} KB/s\n"
+                    f"  ETA: {int(eta)} seconds\n"
+                )
+            else:  # aria2c
+                status = download.status()
+                progress = status.completion * 100
+                speed = status.download_rate / 1024
+                eta = status.eta.total_seconds() if status.eta else float('inf')
+                name = status.name
+                status_text += (
+                    f"📦 {name} (aria2c)\n"
+                    f"  Progress: {progress:.2f}%\n"
+                    f"  Speed: {speed:.2f} KB/s\n"
+                    f"  ETA: {int(eta)} seconds\n"
+                )
+        except Exception as e:
+            logger.error(f"Error checking status for download: {e}")
+            status_text += f"⚠️ Error checking stream {download}\n"
+    await update.message.reply_text(
+        f"```\n{ASCII_ART}\n```\n{status_text}{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /health command for torrent health."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    user_id = update.effective_user.id
+    if user_id not in user_downloads or not user_downloads[user_id]:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}HEALTH: No active streams.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    health_text = f"{HACKER_PREFIX}TORRENT HEALTH ANALYSIS\n"
+    for download in user_downloads[user_id]:
+        try:
+            if isinstance(download, lt.torrent_handle):
+                status = download.status()
+                peers = status.num_peers
+                seeds = status.num_seeds
+                trackers = len(status.trackers)
+                name = status.name
+                health_text += (
+                    f"📦 {name} (libtorrent)\n"
+                    f"  Peers: {peers}\n"
+                    f"  Seeds: {seeds}\n"
+                    f"  Trackers: {trackers}\n"
+                )
+            else:  # aria2c
+                status = download.status()
+                name = status.name
+                health_text += (
+                    f"📦 {name} (aria2c)\n"
+                    f"  Health data unavailable\n"
+                )
+        except Exception as e:
+            logger.error(f"Error checking health for download: {e}")
+            health_text += f"⚠️ Error analyzing stream {download}\n"
+    await update.message.reply_text(
+        f"```\n{ASCII_ART}\n```\n{health_text}{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /pause command."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    user_id = update.effective_user.id
+    if user_id not in user_downloads or not user_downloads[user_id]:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: No active streams to pause.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    for download in user_downloads[user_id]:
+        try:
+            if isinstance(download, lt.torrent_handle):
+                download.pause()
+                logger.info(f"Paused libtorrent download {download.name()} for user {user_id}")
+            else:  # aria2c
+                download.pause()
+                logger.info(f"Paused aria2c download {download.gid} for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error pausing download for user {user_id}: {e}")
+    await update.message.reply_text(
+        f"{HACKER_PREFIX}All streams paused.\n{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /resume command."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    user_id = update.effective_user.id
+    if user_id not in user_downloads or not user_downloads[user_id]:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: No active streams to resume.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    for download in user_downloads[user_id]:
+        try:
+            if isinstance(download, lt.torrent_handle):
+                download.resume()
+                logger.info(f"Resumed libtorrent download {download.name()} for user {user_id}")
+            else:  # aria2c
+                download.unpause()
+                logger.info(f"Resumed aria2c download {download.gid} for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error resuming download for user {user_id}: {e}")
+    await update.message.reply_text(
+        f"{HACKER_PREFIX}All streams resumed.\n{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /cancel command."""
+    await log_ip(update, context)
+    if not await rate_limit_check(update.effective_user.id, context):
+        return
+    user_id = update.effective_user.id
+    if user_id not in user_downloads or not user_downloads[user_id]:
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: No active streams to terminate.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    for download in user_downloads[user_id]:
+        try:
+            if isinstance(download, lt.torrent_handle):
+                ses.remove_torrent(download)
+                logger.info(f"Cancelled libtorrent download {download.name()} for user {user_id}")
+            else:  # aria2c
+                download.remove()
+                logger.info(f"Cancelled aria2c download {download.gid} for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error cancelling download for user {user_id}: {e}")
+    user_downloads[user_id].clear()
+    await update.message.reply_text(
+        f"{HACKER_PREFIX}All streams terminated.\n{HACKER_FOOTER}",
+        parse_mode="Markdown"
+    )
+
+async def handle_magnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle magnet links."""
+    await log_ip(update, context)
+    user_id = update.effective_user.id
+    if not await rate_limit_check(user_id, context):
+        return
+    magnet = update.message.text
+    if not re.match(r'^magnet:\?', magnet):
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: Invalid magnet protocol.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    if len(downloads) >= MAX_CONCURRENT:
+        download_queue.append((update, {"magnet": magnet}))
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}Stream queued. Awaiting matrix slot.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        return
+    await start_download(update, context, magnet=magnet)
+
+async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle .torrent file uploads."""
+    await log_ip(update, context)
+    user_id = update.effective_user.id
+    if not await rate_limit_check(user_id, context):
+        return
+    file = await update.message.document.get_file()
+    file_path = os.path.join(DOWNLOAD_DIR, update.message.document.file_name)
+    try:
+        await file.download_to_drive(file_path)
+        if len(downloads) >= MAX_CONCURRENT:
+            download_queue.append((update, {"torrent_file": file_path}))
+            await update.message.reply_text(
+                f"{HACKER_PREFIX}Stream queued. Awaiting matrix slot.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            return
+        await start_download(update, context, torrent_file=file_path)
+    except Exception as e:
+        logger.error(f"Error processing torrent file for user {user_id}: {e}")
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: Failed to process torrent file: {str(e)}\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, magnet=None, torrent_file=None):
+    """Start a torrent download."""
+    user_id = update.effective_user.id
+    engine = user_engines[user_id]
+    try:
+        if engine == "libtorrent" and ses:
+            if magnet:
+                params = lt.parse_magnet_uri(magnet)
+                params.save_path = DOWNLOAD_DIR
+                download = ses.add_torrent(params)
+            else:  # torrent_file
+                with open(torrent_file, 'rb') as f:
+                    torrent_data = f.read()
+                info = lt.torrent_info(lt.bdecode(torrent_data))
+                params = {'ti': info, 'save_path': DOWNLOAD_DIR}
+                download = ses.add_torrent(params)
+            download.set_max_download_rate(1024 * 1024)  # 1MB/s limit
+            downloads.append(download)
+            user_downloads[user_id].append(download)
+            download_start_times[download] = time.time()
+            name = download.name()
+            torrent_names[download] = name
+            await update.message.reply_text(
+                f"{HACKER_PREFIX}Stream initiated: {name} (libtorrent)\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            await file_selection_prompt(update, context, download, engine)
+        elif engine == "aria2c" and aria2:
+            if magnet:
+                download = aria2.add_magnet(magnet, options={"dir": DOWNLOAD_DIR})
+            else:  # torrent_file
+                download = aria2.add_torrent(torrent_file, options={"dir": DOWNLOAD_DIR})
+            downloads.append(download)
+            user_downloads[user_id].append(download)
+            download_start_times[download] = time.time()
+            name = download.name
+            torrent_names[download] = name
+            await update.message.reply_text(
+                f"{HACKER_PREFIX}Stream initiated: {name} (aria2c)\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            await file_selection_prompt(update, context, download, engine)
         else:
-            os.remove(session_path)
-            await message.answer(
-                "❌ Session is invalid or not authorized. File deleted.",
-                reply_markup=main_menu_kb()
-            )
-            
-    except Exception as e:
-        logger.error(f"Session upload failed: {str(e)}")
-        await message.answer(
-            "❌ Failed to process session file. Please try again.",
-            reply_markup=main_menu_kb()
-        )
-        
-    await state.clear()
-
-@router.callback_query(F.data == "list_sessions")
-async def list_sessions_handler(callback: CallbackQuery, state: FSMContext):
-    """List available sessions"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    try:
-        sessions = await get_active_sessions()
-        if not sessions:
-            await callback.message.edit_text(
-                "No active sessions found. Please upload sessions first.",
-                reply_markup=main_menu_kb()
+            await update.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Selected engine unavailable. Use /engine to switch.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
             )
             return
-            
-        await callback.message.edit_text(
-            "📋 <b>Active Sessions</b>\n\n"
-            "Select a session to view details:",
-            reply_markup=session_selection_kb(sessions)
-        )
-        await state.set_state(BotState.LIST_SESSIONS)
-        
-    except Exception as e:
-        logger.error(f"Failed to list sessions: {str(e)}")
-        await callback.message.edit_text(
-            "❌ Failed to list sessions. Please try again.",
-            reply_markup=main_menu_kb()
-        )
-        
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("select_session:"), BotState.LIST_SESSIONS)
-async def select_session_handler(callback: CallbackQuery, state: FSMContext):
-    """Handle session selection"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    session_file = callback.data.split(':')[1]
-    session_path = os.path.join(Config.SESSION_DIR, session_file)
-    
-    try:
-        async with TelegramClient(session_path, Config.API_ID, Config.API_HASH) as client:
-            me = await client.get_me()
-            info = (
-                f"📌 <b>Session Info</b>\n\n"
-                f"🔹 <b>File:</b> <code>{session_file}</code>\n"
-                f"🔹 <b>User:</b> {me.first_name or ''} {me.last_name or ''}\n"
-                f"🔹 <b>Username:</b> @{me.username}\n"
-                f"🔹 <b>Phone:</b> {me.phone}\n"
-                f"🔹 <b>ID:</b> <code>{me.id}</code>"
-            )
-            
-            await callback.message.edit_text(
-                info,
-                reply_markup=main_menu_kb()
-            )
-            
-    except Exception as e:
-        logger.error(f"Failed to get session info: {str(e)}")
-        await callback.message.edit_text(
-            "❌ Failed to get session info. The session may be invalid.",
-            reply_markup=main_menu_kb()
-        )
-        
-    await state.clear()
-    await callback.answer()
-
-@router.callback_query(F.data == "scrape_members")
-async def scrape_members_handler(callback: CallbackQuery, state: FSMContext):
-    """Initiate member scraping"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    sessions = await get_active_sessions()
-    if not sessions:
-        await callback.message.edit_text(
-            "No active sessions found. Please upload sessions first.",
-            reply_markup=main_menu_kb()
-        )
-        return
-        
-    await callback.message.edit_text(
-        "🔍 <b>Scrape Members</b>\n\n"
-        "Please send the group/channel username or invite link:",
-        reply_markup=cancel_kb()
-    )
-    await state.set_state(BotState.SCRAPE_MEMBERS_INPUT)
-    await callback.answer()
-
-@router.message(BotState.SCRAPE_MEMBERS_INPUT, F.text)
-async def scrape_members_input_handler(message: Message, state: FSMContext):
-    """Handle group input for scraping"""
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Unauthorized access.")
-        return
-        
-    group_input = message.text.strip()
-    sessions = await get_active_sessions()
-    
-    if not sessions:
-        await message.answer(
-            "No active sessions found. Please upload sessions first.",
-            reply_markup=main_menu_kb()
-        )
-        await state.clear()
-        return
-        
-    # Use the first available session
-    session_file = sessions[0]
-    session_path = os.path.join(Config.SESSION_DIR, session_file)
-    
-    try:
-        async with TelegramClient(session_path, Config.API_ID, Config.API_HASH) as client:
-            # Get the group entity
-            try:
-                group_entity = await get_entity_safe(client, group_input)
-            except ValueError:
-                await message.answer(
-                    "❌ Could not find the group/channel. Please check the link/username.",
-                    reply_markup=main_menu_kb()
-                )
-                await state.clear()
-                return
-                
-            await state.update_data({
-                'session_path': session_path,
-                'group_entity': group_entity,
-                'group_input': group_input
-            })
-            
-            await message.answer(
-                f"🔍 <b>Scraping Members</b>\n\n"
-                f"Group: <code>{getattr(group_entity, 'title', group_input)}</code>\n"
-                f"Session: <code>{session_file}</code>\n\n"
-                f"Enter the maximum number of members to scrape (or press Enter for default {Config.SCRAPE_LIMIT}):",
-                reply_markup=cancel_kb()
-            )
-            await state.set_state(BotState.SCRAPE_MEMBERS_PROGRESS)
-            
-    except Exception as e:
-        logger.error(f"Scraping setup failed: {str(e)}")
-        await message.answer(
-            "❌ Failed to initialize scraping. Please try again.",
-            reply_markup=main_menu_kb()
-        )
-        await state.clear()
-
-@router.message(BotState.SCRAPE_MEMBERS_PROGRESS, F.text)
-async def scrape_members_progress_handler(message: Message, state: FSMContext):
-    """Handle scraping with progress updates"""
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Unauthorized access.")
-        return
-        
-    data = await state.get_data()
-    session_path = data.get('session_path')
-    group_entity = data.get('group_entity')
-    group_input = data.get('group_input')
-    
-    try:
-        limit = int(message.text) if message.text.strip().isdigit() else Config.SCRAPE_LIMIT
-        limit = min(limit, Config.SCRAPE_LIMIT)
-    except ValueError:
-        limit = Config.SCRAPE_LIMIT
-        
-    progress_msg = await message.answer(
-        f"🔄 Starting to scrape up to {limit} members from "
-        f"<code>{getattr(group_entity, 'title', group_input)}</code>..."
-    )
-    
-    try:
-        async with TelegramClient(session_path, Config.API_ID, Config.API_HASH) as client:
-            members = []
-            last_update = time.time()
-            
-            async for i, user in enumerate(client.iter_participants(group_entity, aggressive=True, limit=limit)):
-                # Handle names safely
-                first_name = getattr(user, 'first_name', '') or ''
-                last_name = getattr(user, 'last_name', '') or ''
-                full_name = f"{first_name} {last_name}".strip()
-                
-                member = Member(
-                    user_id=user.id,
-                    username=user.username,
-                    access_hash=getattr(user, 'access_hash', None),
-                    name=full_name,
-                    phone=getattr(user, 'phone', None)
-                )
-                members.append(member)
-                
-                # Update progress periodically
-                if (i % Config.BATCH_SIZE == 0) or (time.time() - last_update > Config.PROGRESS_UPDATE_INTERVAL):
-                    await progress_msg.edit_text(
-                        f"🔍 Scraping members...\n\n"
-                        f"Progress: {len(members)}/{limit}\n"
-                        f"Group: <code>{getattr(group_entity, 'title', group_input)}</code>"
-                    )
-                    last_update = time.time()
-                    
-            # Save results
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"members_{getattr(group_entity, 'id', 'unknown')}_{timestamp}.csv"
-            csv_path = await save_members_csv(members, filename)
-            
-            await message.answer_document(
-                FSInputFile(csv_path),
-                caption=f"✅ Successfully scraped {len(members)} members from "
-                       f"<code>{getattr(group_entity, 'title', group_input)}</code>",
-                reply_markup=main_menu_kb()
-            )
-            
-    except ChannelPrivateError:
-        await message.answer(
-            "❌ The channel/group is private and you don't have access.",
-            reply_markup=main_menu_kb()
-        )
-    except Exception as e:
-        logger.error(f"Scraping failed: {str(e)}")
-        await message.answer(
-            f"❌ Scraping failed: {str(e)}",
-            reply_markup=main_menu_kb()
-        )
-    finally:
-        await state.clear()
-
-@router.callback_query(F.data == "add_members")
-async def add_members_handler(callback: CallbackQuery, state: FSMContext):
-    """Initiate member adding process"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    sessions = await get_active_sessions()
-    if not sessions:
-        await callback.message.edit_text(
-            "No active sessions found. Please upload sessions first.",
-            reply_markup=main_menu_kb()
-        )
-        return
-        
-    await callback.message.edit_text(
-        "➕ <b>Add Members</b>\n\n"
-        "Please send the target group/channel username or invite link "
-        "where members should be added:",
-        reply_markup=cancel_kb()
-    )
-    await state.set_state(BotState.ADD_MEMBERS_INPUT_GROUP)
-    await callback.answer()
-
-@router.message(BotState.ADD_MEMBERS_INPUT_GROUP, F.text)
-async def add_members_group_handler(message: Message, state: FSMContext):
-    """Handle target group input for member adding"""
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Unauthorized access.")
-        return
-        
-    target_group = message.text.strip()
-    sessions = await get_active_sessions()
-    
-    if not sessions:
-        await message.answer(
-            "No active sessions found. Please upload sessions first.",
-            reply_markup=main_menu_kb()
-        )
-        await state.clear()
-        return
-        
-    await state.update_data({'target_group': target_group})
-    
-    await message.answer(
-        "📁 Please upload the CSV file containing members to add:",
-        reply_markup=cancel_kb()
-    )
-    await state.set_state(BotState.ADD_MEMBERS_INPUT_FILE)
-
-@router.message(BotState.ADD_MEMBERS_INPUT_FILE, F.document)
-async def add_members_file_handler(message: Message, state: FSMContext):
-    """Handle member file upload for adding"""
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Unauthorized access.")
-        return
-        
-    if not message.document.file_name.endswith('.csv'):
-        await message.answer(
-            "❌ Invalid file type. Please upload a CSV file.",
-            reply_markup=cancel_kb()
-        )
-        return
-        
-    data = await state.get_data()
-    target_group = data.get('target_group')
-    
-    try:
-        # Save the uploaded file
-        file_path = os.path.join(Config.DATA_DIR, message.document.file_name)
-        await bot.download(message.document, destination=file_path)
-        
-        # Load members
-        members = await load_members_csv(message.document.file_name)
-        
-        if not members:
-            await message.answer(
-                "❌ No valid members found in the CSV file.",
-                reply_markup=main_menu_kb()
-            )
-            await state.clear()
-            return
-            
-        await state.update_data({
-            'members_file': file_path,
-            'members_count': len(members)
+        user_history[user_id].append({
+            "name": name,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "engine": engine
         })
-        
-        sessions = await get_active_sessions()
-        await message.answer(
-            f"➕ <b>Add Members</b>\n\n"
-            f"🔹 Target: <code>{target_group}</code>\n"
-            f"🔹 Members: {len(members)}\n\n"
-            f"Select a session to use:",
-            reply_markup=session_selection_kb(sessions)
-        )
-        await state.set_state(BotState.ADD_MEMBERS_PROGRESS)
-        
+        user_history[user_id] = user_history[user_id][-HISTORY_LIMIT:]
     except Exception as e:
-        logger.error(f"Member file processing failed: {str(e)}")
-        await message.answer(
-            "❌ Failed to process member file. Please try again.",
-            reply_markup=main_menu_kb()
+        logger.error(f"Error starting download for user {user_id}: {e}")
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: Failed to initiate stream: {str(e)}\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
         )
-        await state.clear()
 
-@router.callback_query(F.data.startswith("select_session:"), BotState.ADD_MEMBERS_PROGRESS)
-async def add_members_session_handler(callback: CallbackQuery, state: FSMContext):
-    """Handle session selection for member adding"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    session_file = callback.data.split(':')[1]
-    session_path = os.path.join(Config.SESSION_DIR, session_file)
-    data = await state.get_data()
-    
-    target_group = data.get('target_group')
-    members_file = data.get('members_file')
-    members_count = data.get('members_count')
-    
-    progress_msg = await callback.message.edit_text(
-        f"🔄 Preparing to add {members_count} members to "
-        f"<code>{target_group}</code> using session <code>{session_file}</code>..."
-    )
-    
+async def file_selection_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, download, engine):
+    """Prompt user to select files from torrent."""
     try:
-        members = await load_members_csv(os.path.basename(members_file))
-        
-        async with TelegramClient(session_path, Config.API_ID, Config.API_HASH) as client:
-            # Get target group entity
-            try:
-                target_entity = await get_entity_safe(client, target_group)
-            except ValueError:
-                await callback.message.answer(
-                    "❌ Could not find the target group. Please check the link/username.",
-                    reply_markup=main_menu_kb()
-                )
-                await state.clear()
+        if engine == "libtorrent":
+            info = download.torrent_info()
+            if not info:
                 return
-                
-            # Start adding members
-            added = 0
-            skipped = 0
-            errors = 0
-            last_update = time.time()
-            
-            for i, member in enumerate(members, 1):
-                try:
-                    if member.username:
-                        user_entity = await client.get_input_entity(member.username)
-                    elif member.access_hash:
-                        user_entity = InputPeerUser(member.user_id, member.access_hash)
-                    else:
-                        skipped += 1
-                        continue
-                        
-                    await client(InviteToChannelRequest(
-                        channel=await client.get_input_entity(target_entity),
-                        users=[user_entity]
-                    ))
-                    
-                    added += 1
-                    
-                    # Update progress periodically
-                    if (i % 10 == 0) or (time.time() - last_update > Config.PROGRESS_UPDATE_INTERVAL):
-                        await progress_msg.edit_text(
-                            f"➕ Adding members...\n\n"
-                            f"🔹 Target: <code>{getattr(target_entity, 'title', target_group)}</code>\n"
-                            f"🔹 Progress: {i}/{len(members)}\n"
-                            f"✅ Added: {added}\n"
-                            f"⚠️ Skipped: {skipped}\n"
-                            f"❌ Errors: {errors}"
-                        )
-                        last_update = time.time()
-                        
-                    # Random delay to avoid flood
-                    if i < len(members):
-                        delay = random.randint(*Config.DELAY_BETWEEN_ADDS)
-                        await asyncio.sleep(delay)
-                        
-                except PeerFloodError:
-                    errors += len(members) - i
-                    await progress_msg.edit_text(
-                        f"⚠️ Flood error detected!\n\n"
-                        f"✅ Added: {added}\n"
-                        f"⚠️ Skipped: {skipped}\n"
-                        f"❌ Errors: {errors}\n\n"
-                        f"Stopping to prevent account restrictions."
-                    )
-                    break
-                except (UserPrivacyRestrictedError, UserNotMutualContactError):
-                    skipped += 1
-                except FloodWaitError as e:
-                    errors += 1
-                    wait_time = e.seconds
-                    await progress_msg.edit_text(
-                        f"⏳ Waiting {wait_time} seconds due to flood limit..."
-                    )
-                    await asyncio.sleep(wait_time)
-                except Exception as e:
-                    errors += 1
-                    logger.error(f"Error adding member: {str(e)}")
-                    
-            # Final report
-            await callback.message.answer(
-                f"🏁 <b>Operation Complete</b>\n\n"
-                f"🔹 Target: <code>{getattr(target_entity, 'title', target_group)}</code>\n"
-                f"🔹 Total: {len(members)}\n"
-                f"✅ Added: {added}\n"
-                f"⚠️ Skipped: {skipped}\n"
-                f"❌ Errors: {errors}",
-                reply_markup=main_menu_kb()
-            )
-            
-    except Exception as e:
-        logger.error(f"Member adding failed: {str(e)}")
-        await callback.message.answer(
-            f"❌ Failed to add members: {str(e)}",
-            reply_markup=main_menu_kb()
+            keyboard = []
+            for i, file in enumerate(info.files()):
+                keyboard.append([InlineKeyboardButton(
+                    file.path,
+                    callback_data=f"file_{id(download)}_{i}"
+                )])
+            keyboard.append([InlineKeyboardButton(
+                "Download All",
+                callback_data=f"file_{id(download)}_all"
+            )])
+        else:  # aria2c
+            files = download.files
+            if not files:
+                return
+            keyboard = []
+            for i, file in enumerate(files):
+                keyboard.append([InlineKeyboardButton(
+                    file.path,
+                    callback_data=f"file_{download.gid}_{i}"
+                )])
+            keyboard.append([InlineKeyboardButton(
+                "Download All",
+                callback_data=f"file_{download.gid}_all"
+            )])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}Select files to stream:\n{HACKER_FOOTER}",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
         )
-    finally:
-        await state.clear()
-        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error creating file selection prompt: {e}")
+        await update.message.reply_text(
+            f"{HACKER_PREFIX}ERROR: Failed to display file selection: {str(e)}\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
 
-@router.callback_query(F.data == "cancel_op")
-async def cancel_operation_handler(callback: CallbackQuery, state: FSMContext):
-    """Cancel current operation"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    await callback.message.edit_text(
-        "❌ Operation cancelled.",
-        reply_markup=main_menu_kb()
-    )
-    await state.clear()
-    await callback.answer()
-
-@router.callback_query(F.data == "bot_stats")
-async def bot_stats_handler(callback: CallbackQuery):
-    """Show bot statistics"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    sessions = await get_active_sessions()
-    data_files = [f for f in os.listdir(Config.DATA_DIR) if f.endswith('.csv')]
-    
-    stats = (
-        f"📊 <b>Bot Statistics</b>\n\n"
-        f"🔹 Active sessions: {len(sessions)}\n"
-        f"🔹 Data files: {len(data_files)}\n"
-        f"🔹 Last activity: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    
-    await callback.message.edit_text(
-        stats,
-        reply_markup=main_menu_kb()
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "bot_settings")
-async def bot_settings_handler(callback: CallbackQuery):
-    """Show bot settings"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Unauthorized", show_alert=True)
-        return
-        
-    settings = (
-        f"⚙️ <b>Bot Settings</b>\n\n"
-        f"🔹 Max adds per session: {Config.MAX_ADD_PER_SESSION}\n"
-        f"🔹 Delay between adds: {Config.DELAY_BETWEEN_ADDS[0]}-{Config.DELAY_BETWEEN_ADDS[1]}s\n"
-        f"🔹 Scrape limit: {Config.SCRAPE_LIMIT}\n"
-        f"🔹 Rate limit: {Config.RATE_LIMIT} msg/s\n"
-        f"🔹 Admin mode: {'🔒 Restricted' if Config.RESTRICT_MODE else '🔓 Open'}"
-    )
-    
-    await callback.message.edit_text(
-        settings,
-        reply_markup=main_menu_kb()
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "back_to_main")
-async def back_to_main_handler(callback: CallbackQuery, state: FSMContext):
-    """Return to main menu"""
-    await callback.message.edit_text(
-        "👨‍💻 <b>Telegram Member Manager</b>\n\n"
-        "Choose an action:",
-        reply_markup=main_menu_kb()
-    )
-    await state.clear()
-    await callback.answer()
-
-# ==================== ERROR HANDLING ====================
-@router.errors()
-async def error_handler(event, **kwargs):
-    """Global error handler"""
-    logger.error(f"Error occurred: {str(event.exception)}", exc_info=True)
-    
-    # Try to notify the user
-    try:
-        if 'update' in kwargs and hasattr(kwargs['update'], 'message'):
-            await kwargs['update'].message.answer(
-                "❌ An error occurred. Please check logs.",
-                reply_markup=main_menu_kb()
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button callbacks."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data.split("_")
+    if data[0] == "magnet":
+        magnet = "_".join(data[1:])
+        if len(downloads) >= MAX_CONCURRENT:
+            download_queue.append((update, {"magnet": magnet}))
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}Stream queued. Awaiting matrix slot.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
             )
-    except Exception as e:
-        logger.error(f"Error in error handler: {str(e)}")
+            return
+        await start_download(update, context, magnet=magnet)
+    elif data[0] == "file":
+        download_id = data[1]
+        download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
+        if not download or download_id not in [str(id(d)) if isinstance(d, lt.torrent_handle) else d.gid for d in user_downloads[user_id]]:
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            if isinstance(download, lt.torrent_handle):
+                info = download.torrent_info()
+                priorities = [0] * info.num_files()
+                if data[2] == "all":
+                    priorities = [1] * info.num_files()
+                else:
+                    file_index = int(data[2])
+                    priorities[file_index] = 1
+                download.prioritize_files(priorities)
+            else:  # aria2c
+                files = download.files
+                selected = [False] * len(files)
+                if data[2] == "all":
+                    selected = [True] * len(files)
+                else:
+                    file_index = int(data[2])
+                    selected[file_index] = True
+                download.update(options={"select-file": ",".join(str(i + 1) for i, s in enumerate(selected) if s)})
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}File selection updated. Stream active.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Error processing file selection for user {user_id}: {e}")
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Failed to update file selection: {str(e)}\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
 
-# ==================== SHUTDOWN HANDLING ====================
-async def shutdown(signal, loop):
-    """Cleanup tasks on shutdown"""
-    logger.info(f"Received {signal.name}, shutting down...")
-    await bot.close()
-    await dp.storage.close()
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
+async def process_queue(context: ContextTypes.DEFAULT_TYPE):
+    """Process queued downloads."""
+    if download_queue and len(downloads) < MAX_CONCURRENT:
+        update, item = download_queue.pop(0)
+        try:
+            if "magnet" in item:
+                await start_download(update, context, magnet=item["magnet"])
+            elif "torrent_file" in item:
+                await start_download(update, context, torrent_file=item["torrent_file"])
+        except Exception as e:
+            logger.error(f"Error processing queued download: {e}")
+            await update.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Failed to start queued stream: {str(e)}\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+        finally:
+            if "torrent_file" in item and os.path.exists(item["torrent_file"]):
+                os.remove(item["torrent_file"])
 
-def cleanup():
-    """Cleanup resources"""
+async def check_downloads(context: ContextTypes.DEFAULT_TYPE):
+    """Check download progress, handle stalls, and send files."""
+    global downloads
+    completed = []
+    stalled = []
+    now = time.time()
+    for download in downloads:
+        try:
+            if isinstance(download, lt.torrent_handle):
+                if not download.is_valid():
+                    continue
+                status = download.status()
+                if download in download_start_times and (now - download_start_times[download]) > STALL_TIMEOUT:
+                    if status.progress == 0 or status.download_rate == 0:
+                        stalled.append(download)
+                        continue
+                if status.is_seeding:
+                    completed.append(download)
+                    info = download.torrent_info()
+                    for i, file in enumerate(info.files()):
+                        if download.file_priority(i) == 0:
+                            continue
+                        file_path = os.path.join(DOWNLOAD_DIR, file.path)
+                        for user_id, user_dls in user_downloads.items():
+                            if download in user_dls:
+                                await context.bot.send_message(
+                                    chat_id=user_id,
+                                    text=f"{HACKER_PREFIX}Stream completed: {torrent_names.get(download, 'Unknown')} (libtorrent)\n{HACKER_FOOTER}",
+                                    parse_mode="Markdown"
+                                )
+                                await send_file(
+                                    Update(0, message=telegram.Message(
+                                        message_id=0,
+                                        chat=telegram.Chat(id=user_id, type='private'),
+                                        date=datetime.now(),
+                                        document=None
+                                    )),
+                                    file_path,
+                                    context
+                                )
+                    ses.remove_torrent(download)
+                    for user_id, user_dls in user_downloads.items():
+                        if download in user_dls:
+                            user_downloads[user_id].remove(download)
+                            download_start_times.pop(download, None)
+                            torrent_names.pop(download, None)
+                            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+            else:  # aria2c
+                status = download.status()
+                if download in download_start_times and (now - download_start_times[download]) > STALL_TIMEOUT:
+                    if status.completion == 0 or status.download_rate == 0:
+                        stalled.append(download)
+                        continue
+                if status.is_complete:
+                    completed.append(download)
+                    for file in download.files:
+                        if not file.selected:
+                            continue
+                        file_path = file.path
+                        for user_id, user_dls in user_downloads.items():
+                            if download in user_dls:
+                                await context.bot.send_message(
+                                    chat_id=user_id,
+                                    text=f"{HACKER_PREFIX}Stream completed: {torrent_names.get(download, 'Unknown')} (aria2c)\n{HACKER_FOOTER}",
+                                    parse_mode="Markdown"
+                                )
+                                await send_file(
+                                    Update(0, message=telegram.Message(
+                                        message_id=0,
+                                        chat=telegram.Chat(id=user_id, type='private'),
+                                        date=datetime.now(),
+                                        document=None
+                                    )),
+                                    file_path,
+                                    context
+                                )
+                    download.remove()
+                    for user_id, user_dls in user_downloads.items():
+                        if download in user_dls:
+                            user_downloads[user_id].remove(download)
+                            download_start_times.pop(download, None)
+                            torrent_names.pop(download, None)
+                            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Error checking download: {e}")
+    for download in stalled:
+        try:
+            if isinstance(download, lt.torrent_handle):
+                ses.remove_torrent(download)
+                engine = "libtorrent"
+            else:  # aria2c
+                download.remove()
+                engine = "aria2c"
+            for user_id, user_dls in user_downloads.items():
+                if download in user_dls:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"{HACKER_PREFIX}Stream stalled and terminated: {torrent_names.get(download, 'Unknown')} ({engine})\n{HACKER_FOOTER}",
+                        parse_mode="Markdown"
+                    )
+                    logger.info(f"Cancelled stalled download for user {user_id}")
+                    user_downloads[user_id].remove(download)
+                    download_start_times.pop(download, None)
+                    torrent_names.pop(download, None)
+        except Exception as e:
+            logger.error(f"Error cancelling stalled download: {e}")
+    downloads = [d for d in downloads if d not in completed and d not in stalled]
+
+def signal_handler(sig, frame):
+    """Handle graceful shutdown."""
+    logger.info("Shutting down CYBERLINK matrix...")
+    for download in downloads:
+        try:
+            if isinstance(download, lt.torrent_handle):
+                ses.remove_torrent(download)
+            else:  # aria2c
+                download.remove()
+        except Exception:
+            pass
+    if aria2_process:
+        aria2_process.terminate()
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    sys.exit(0)
+
+def main():
+    """Start the bot."""
     try:
-        os.remove(Config.PID_FILE)
-    except OSError:
-        pass
-    logger.info("Cleanup complete.")
-
-# ==================== MAIN ====================
-async def main():
-    """Main application entry point"""
-    try:
-        with PidManager(Config.PID_FILE):
-            # Register cleanup handlers
-            atexit.register(cleanup)
-            loop = asyncio.get_running_loop()
-            
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.add_signal_handler(
-                    sig,
-                    lambda s=sig: asyncio.create_task(shutdown(s, loop))
-            
-            logger.info("Starting bot...")
-            await dp.start_polling(bot)
-            
-    except RuntimeError as e:
-        logger.error(str(e))
-        sys.exit(1)
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("engine", engine))
+        application.add_handler(CommandHandler("search", search_torrents))
+        application.add_handler(CommandHandler("status", status))
+        application.add_handler(CommandHandler("pause", pause))
+        application.add_handler(CommandHandler("resume", resume))
+        application.add_handler(CommandHandler("cancel", cancel))
+        application.add_handler(CommandHandler("history", history))
+        application.add_handler(CommandHandler("health", health))
+        application.add_handler(MessageHandler(filters.Regex(r'^magnet:\?'), handle_magnet))
+        application.add_handler(MessageHandler(filters.Document.FileExtension("torrent"), handle_torrent_file))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        
+        application.job_queue.run_repeating(check_downloads, interval=10)
+        application.job_queue.run_repeating(process_queue, interval=5)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        logger.info("CYBERLINK matrix online.")
+        application.run_polling()
     except Exception as e:
-        logger.critical(f"Fatal error: {str(e)}", exc_info=True)
+        logger.error(f"Failed to initialize matrix: {e}")
         sys.exit(1)
-    finally:
-        logger.info("Bot stopped")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    main()
