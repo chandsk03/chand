@@ -3,7 +3,7 @@ import logging
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from datetime import datetime, timedelta
+from datetime import datetime
 import asyncio
 import re
 import requests
@@ -30,18 +30,17 @@ DOWNLOAD_DIR = "downloads"
 MAX_CONCURRENT = 3
 RATE_LIMIT_SECONDS = 60
 RATE_LIMIT_REQUESTS = 10
-HISTORY_LIMIT = 20
 STALL_TIMEOUT = 300
 ARIA2_RPC_PORT = 6800
 YTS_API_URL = "https://yts.mx/api/v2/list_movies.json"
-DEFAULT_ENGINE = "libtorrent"
+DEFAULT_ENGINE = "aria2c"
 
 # Hacker aesthetic
-HACKER_PREFIX = "💾 [CYBERLINK v4.1] "
+HACKER_PREFIX = "💾 [CYBERLINK v4.2] "
 HACKER_FOOTER = "🔒 SECURE TRANSMISSION ENDED"
 ASCII_ART = """
    ╔════════════════════════════════════╗
-   ║  CYBERLINK TORRENT MATRIX v4.1     ║
+   ║  CYBERLINK TORRENT MATRIX v4.2     ║
    ║  INITIALIZING HACKER PROTOCOL...   ║
    ╚════════════════════════════════════╝
 """
@@ -61,7 +60,6 @@ logger = logging.getLogger(__name__)
 try:
     settings = {
         'listen_interfaces': '0.0.0.0:6881',
-        'outgoing_interfaces': '',
         'allow_multiple_connections_per_ip': True,
         'enable_dht': True,
         'enable_lsd': True,
@@ -102,10 +100,8 @@ downloads = []
 download_queue = []
 user_downloads = defaultdict(list)
 user_requests = defaultdict(list)
-user_history = defaultdict(list)
 download_start_times = {}
 torrent_names = {}
-user_engines = defaultdict(lambda: DEFAULT_ENGINE)
 
 # Ensure download directory exists
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -116,7 +112,7 @@ async def send_file(update: Update, file_path: str, context: ContextTypes.DEFAUL
         file_size = os.path.getsize(file_path)
         if file_size > 2 * 1024 * 1024 * 1024:
             await update.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: File exceeds Telegram's 2GB limit.\n{HACKER_FOOTER}",
+                f"{HACKER_PREFIX}ERROR: File exceeds 2GB limit.\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
             )
             return
@@ -168,18 +164,22 @@ async def log_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Action by user {user_id} from IP: Unknown (Telegram API limitation)")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
+    """Handle /start command with inline buttons."""
     await log_ip(update, context)
     if not await rate_limit_check(update.effective_user.id, context):
         return
+    keyboard = [
+        [InlineKeyboardButton("🔍 Search Movies", callback_data="search_movie")],
+        [InlineKeyboardButton("📥 Send Magnet/Link", callback_data="send_magnet")],
+        [InlineKeyboardButton("📂 Upload Torrent File", callback_data="upload_torrent")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         f"```\n{ASCII_ART}\n```\n"
         f"{HACKER_PREFIX}WELCOME TO CYBERLINK TORRENT MATRIX\n"
-        "🌐 Upload magnet links or .torrent files to initiate download protocols.\n"
-        "📡 Use /search to locate movie torrents.\n"
-        "⚙️ Select engine with /engine [libtorrent|aria2c].\n"
-        "📚 Commands: /help, /status, /pause, /resume, /cancel, /history, /health\n"
+        "🌐 Initiate download protocols with buttons below.\n"
         f"{HACKER_FOOTER}",
+        reply_markup=reply_markup,
         parse_mode="Markdown"
     )
 
@@ -190,79 +190,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"```\n{ASCII_ART}\n```\n"
-        f"{HACKER_PREFIX}CYBERLINK COMMAND MATRIX\n"
-        "📟 /start - Initialize the matrix\n"
-        "📚 /help - Display this protocol\n"
-        "📡 /search - Scan for movie torrents\n"
-        "⚙️ /engine - Switch download engine\n"
-        "📊 /status - Monitor active streams\n"
-        "⏸️ /pause - Suspend download stream\n"
-        "▶️ /resume - Reactivate download stream\n"
-        "🛑 /cancel - Terminate download stream\n"
-        "📜 /history - Access download archives\n"
-        "🔍 /health - Analyze torrent health\n"
-        "📥 Send magnet links or .torrent files to engage.\n"
+        f"{HACKER_PREFIX}CYBERLINK PROTOCOL\n"
+        "📟 Use /start to access the main interface.\n"
+        "📥 Send magnet links or .torrent files directly.\n"
+        "🔍 Click buttons to search movies or manage downloads.\n"
         f"{HACKER_FOOTER}",
         parse_mode="Markdown"
     )
 
-async def engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /engine command to switch download engine."""
+async def search_torrents(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str = None):
+    """Handle movie search with inline buttons."""
     await log_ip(update, context)
     if not await rate_limit_check(update.effective_user.id, context):
         return
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}Current engine: {user_engines[user_id]}\n"
-            f"Usage: /engine [libtorrent|aria2c]\n{HACKER_FOOTER}",
+    if not query:
+        await update.callback_query.message.reply_text(
+            f"{HACKER_PREFIX}Enter a movie title to scan (e.g., 'Matrix').\n{HACKER_FOOTER}",
             parse_mode="Markdown"
         )
+        context.user_data["awaiting_search"] = True
         return
-    engine = context.args[0].lower()
-    if engine not in ["libtorrent", "aria2c"]:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: Invalid engine. Use 'libtorrent' or 'aria2c'.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    if engine == "libtorrent" and ses is None:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: libtorrent unavailable.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    if engine == "aria2c" and aria2 is None:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: aria2c unavailable.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    user_engines[user_id] = engine
-    await update.message.reply_text(
-        f"{HACKER_PREFIX}Engine switched to {engine}.\n{HACKER_FOOTER}",
-        parse_mode="Markdown"
-    )
-
-async def search_torrents(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /search command for movie torrents."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    if not context.args:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: Provide a movie title (e.g., /search Matrix).\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    query = " ".join(context.args)
     try:
         response = requests.get(YTS_API_URL, params={"query_term": query, "limit": 5})
         response.raise_for_status()
         data = response.json()
         movies = data.get("data", {}).get("movies", [])
         if not movies:
-            await update.message.reply_text(
+            await update.callback_query.message.reply_text(
                 f"{HACKER_PREFIX}SCAN COMPLETE: No torrents found for '{query}'.\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
             )
@@ -281,208 +235,17 @@ async def search_torrents(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 ])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
+        await update.callback_query.message.reply_text(
             f"{HACKER_PREFIX}TORRENT SCAN RESULTS FOR '{query}'\nSelect a stream:\n{HACKER_FOOTER}",
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
     except Exception as e:
         logger.error(f"Error searching torrents for '{query}': {e}")
-        await update.message.reply_text(
+        await update.callback_query.message.reply_text(
             f"{HACKER_PREFIX}ERROR: Torrent scan failed: {str(e)}\n{HACKER_FOOTER}",
             parse_mode="Markdown"
         )
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /history command."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    user_id = update.effective_user.id
-    if not user_history[user_id]:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ARCHIVES: No download history.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    history_text = f"{HACKER_PREFIX}DOWNLOAD ARCHIVES\n"
-    for idx, item in enumerate(user_history[user_id], 1):
-        history_text += f"[{idx}] {item['name']} ({item['time']}, {item['engine']})\n"
-    await update.message.reply_text(
-        f"```\n{ASCII_ART}\n```\n{history_text}{HACKER_FOOTER}",
-        parse_mode="Markdown"
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    user_id = update.effective_user.id
-    if user_id not in user_downloads or not user_downloads[user_id]:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}STATUS: No active streams.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    status_text = f"{HACKER_PREFIX}ACTIVE STREAMS\n"
-    for download in user_downloads[user_id]:
-        try:
-            if isinstance(download, lt.torrent_handle):
-                status = download.status()
-                progress = status.progress * 100
-                speed = status.download_rate / 1024
-                eta = (status.total_wanted - status.total_wanted_done) / (status.download_rate + 1)
-                name = status.name
-                status_text += (
-                    f"📦 {name} (libtorrent)\n"
-                    f"  Progress: {progress:.2f}%\n"
-                    f"  Speed: {speed:.2f} KB/s\n"
-                    f"  ETA: {int(eta)} seconds\n"
-                )
-            else:  # aria2c
-                status = download.status()
-                progress = status.completion * 100
-                speed = status.download_rate / 1024
-                eta = status.eta.total_seconds() if status.eta else float('inf')
-                name = status.name
-                status_text += (
-                    f"📦 {name} (aria2c)\n"
-                    f"  Progress: {progress:.2f}%\n"
-                    f"  Speed: {speed:.2f} KB/s\n"
-                    f"  ETA: {int(eta)} seconds\n"
-                )
-        except Exception as e:
-            logger.error(f"Error checking status for download: {e}")
-            status_text += f"⚠️ Error checking stream {download}\n"
-    await update.message.reply_text(
-        f"```\n{ASCII_ART}\n```\n{status_text}{HACKER_FOOTER}",
-        parse_mode="Markdown"
-    )
-
-async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /health command for torrent health."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    user_id = update.effective_user.id
-    if user_id not in user_downloads or not user_downloads[user_id]:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}HEALTH: No active streams.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    health_text = f"{HACKER_PREFIX}TORRENT HEALTH ANALYSIS\n"
-    for download in user_downloads[user_id]:
-        try:
-            if isinstance(download, lt.torrent_handle):
-                status = download.status()
-                peers = status.num_peers
-                seeds = status.num_seeds
-                trackers = len(status.trackers)
-                name = status.name
-                health_text += (
-                    f"📦 {name} (libtorrent)\n"
-                    f"  Peers: {peers}\n"
-                    f"  Seeds: {seeds}\n"
-                    f"  Trackers: {trackers}\n"
-                )
-            else:  # aria2c
-                status = download.status()
-                name = status.name
-                health_text += (
-                    f"📦 {name} (aria2c)\n"
-                    f"  Health data unavailable\n"
-                )
-        except Exception as e:
-            logger.error(f"Error checking health for download: {e}")
-            health_text += f"⚠️ Error analyzing stream {download}\n"
-    await update.message.reply_text(
-        f"```\n{ASCII_ART}\n```\n{health_text}{HACKER_FOOTER}",
-        parse_mode="Markdown"
-    )
-
-async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /pause command."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    user_id = update.effective_user.id
-    if user_id not in user_downloads or not user_downloads[user_id]:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: No active streams to pause.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    for download in user_downloads[user_id]:
-        try:
-            if isinstance(download, lt.torrent_handle):
-                download.pause()
-                logger.info(f"Paused libtorrent download {download.name()} for user {user_id}")
-            else:  # aria2c
-                download.pause()
-                logger.info(f"Paused aria2c download {download.gid} for user {user_id}")
-        except Exception as e:
-            logger.error(f"Error pausing download for user {user_id}: {e}")
-    await update.message.reply_text(
-        f"{HACKER_PREFIX}All streams paused.\n{HACKER_FOOTER}",
-        parse_mode="Markdown"
-    )
-
-async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /resume command."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    user_id = update.effective_user.id
-    if user_id not in user_downloads or not user_downloads[user_id]:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: No active streams to resume.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    for download in user_downloads[user_id]:
-        try:
-            if isinstance(download, lt.torrent_handle):
-                download.resume()
-                logger.info(f"Resumed libtorrent download {download.name()} for user {user_id}")
-            else:  # aria2c
-                download.unpause()
-                logger.info(f"Resumed aria2c download {download.gid} for user {user_id}")
-        except Exception as e:
-            logger.error(f"Error resuming download for user {user_id}: {e}")
-    await update.message.reply_text(
-        f"{HACKER_PREFIX}All streams resumed.\n{HACKER_FOOTER}",
-        parse_mode="Markdown"
-    )
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /cancel command."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    user_id = update.effective_user.id
-    if user_id not in user_downloads or not user_downloads[user_id]:
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: No active streams to terminate.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    for download in user_downloads[user_id]:
-        try:
-            if isinstance(download, lt.torrent_handle):
-                ses.remove_torrent(download)
-                logger.info(f"Cancelled libtorrent download {download.name()} for user {user_id}")
-            else:  # aria2c
-                download.remove()
-                logger.info(f"Cancelled aria2c download {download.gid} for user {user_id}")
-        except Exception as e:
-            logger.error(f"Error cancelling download for user {user_id}: {e}")
-    user_downloads[user_id].clear()
-    await update.message.reply_text(
-        f"{HACKER_PREFIX}All streams terminated.\n{HACKER_FOOTER}",
-        parse_mode="Markdown"
-    )
 
 async def handle_magnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle magnet links."""
@@ -537,7 +300,7 @@ async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, magnet=None, torrent_file=None):
     """Start a torrent download."""
     user_id = update.effective_user.id
-    engine = user_engines[user_id]
+    engine = DEFAULT_ENGINE
     try:
         if engine == "libtorrent" and ses:
             if magnet:
@@ -550,14 +313,19 @@ async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, mag
                 info = lt.torrent_info(lt.bdecode(torrent_data))
                 params = {'ti': info, 'save_path': DOWNLOAD_DIR}
                 download = ses.add_torrent(params)
-            download.set_max_download_rate(1024 * 1024)  # 1MB/s limit
             downloads.append(download)
             user_downloads[user_id].append(download)
             download_start_times[download] = time.time()
             name = download.name()
             torrent_names[download] = name
+            keyboard = [
+                [InlineKeyboardButton("📊 Progress", callback_data=f"progress_{id(download)}")],
+                [InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{id(download)}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
                 f"{HACKER_PREFIX}Stream initiated: {name} (libtorrent)\n{HACKER_FOOTER}",
+                reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
             await file_selection_prompt(update, context, download, engine)
@@ -571,23 +339,23 @@ async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, mag
             download_start_times[download] = time.time()
             name = download.name
             torrent_names[download] = name
+            keyboard = [
+                [InlineKeyboardButton("📊 Progress", callback_data=f"progress_{download.gid}")],
+                [InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{download.gid}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
                 f"{HACKER_PREFIX}Stream initiated: {name} (aria2c)\n{HACKER_FOOTER}",
+                reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
             await file_selection_prompt(update, context, download, engine)
         else:
             await update.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Selected engine unavailable. Use /engine to switch.\n{HACKER_FOOTER}",
+                f"{HACKER_PREFIX}ERROR: Download engine unavailable.\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
             )
             return
-        user_history[user_id].append({
-            "name": name,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "engine": engine
-        })
-        user_history[user_id] = user_history[user_id][-HISTORY_LIMIT:]
     except Exception as e:
         logger.error(f"Error starting download for user {user_id}: {e}")
         await update.message.reply_text(
@@ -645,7 +413,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     data = query.data.split("_")
-    if data[0] == "magnet":
+    if data[0] == "search":
+        await search_torrents(update, context)
+    elif data[0] == "send":
+        await query.message.reply_text(
+            f"{HACKER_PREFIX}Send a magnet link to initiate stream.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting_magnet"] = True
+    elif data[0] == "upload":
+        await query.message.reply_text(
+            f"{HACKER_PREFIX}Upload a .torrent file to initiate stream.\n{HACKER_FOOTER}",
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting_torrent"] = True
+    elif data[0] == "magnet":
         magnet = "_".join(data[1:])
         if len(downloads) >= MAX_CONCURRENT:
             download_queue.append((update, {"magnet": magnet}))
@@ -691,6 +473,80 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error processing file selection for user {user_id}: {e}")
             await query.message.reply_text(
                 f"{HACKER_PREFIX}ERROR: Failed to update file selection: {str(e)}\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+    elif data[0] == "progress":
+        download_id = data[1]
+        download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
+        if not download or download_id not in [str(id(d)) if isinstance(d, lt.torrent_handle) else d.gid for d in user_downloads[user_id]]:
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            if isinstance(download, lt.torrent_handle):
+                status = download.status()
+                progress = status.progress * 100
+                speed = status.download_rate / 1024
+                eta = (status.total_wanted - status.total_wanted_done) / (status.download_rate + 1)
+                name = status.name
+                status_text = (
+                    f"📦 {name} (libtorrent)\n"
+                    f"  Progress: {progress:.2f}%\n"
+                    f"  Speed: {speed:.2f} KB/s\n"
+                    f"  ETA: {int(eta)} seconds\n"
+                )
+            else:  # aria2c
+                status = download.status()
+                progress = status.completion * 100
+                speed = status.download_rate / 1024
+                eta = status.eta.total_seconds() if status.eta else float('inf')
+                name = status.name
+                status_text = (
+                    f"📦 {name} (aria2c)\n"
+                    f"  Progress: {progress:.2f}%\n"
+                    f"  Speed: {speed:.2f} KB/s\n"
+                    f"  ETA: {int(eta)} seconds\n"
+                )
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}STREAM STATUS\n{status_text}{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Error checking progress: {e}")
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Failed to check progress: {str(e)}\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+    elif data[0] == "cancel":
+        download_id = data[1]
+        download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
+        if not download or download_id not in [str(id(d)) if isinstance(d, lt.torrent_handle) else d.gid for d in user_downloads[user_id]]:
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            if isinstance(download, lt.torrent_handle):
+                ses.remove_torrent(download)
+                engine = "libtorrent"
+            else:  # aria2c
+                download.remove()
+                engine = "aria2c"
+            downloads.remove(download)
+            user_downloads[user_id].remove(download)
+            download_start_times.pop(download, None)
+            torrent_names.pop(download, None)
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}Stream terminated: {torrent_names.get(download, 'Unknown')} ({engine})\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Error cancelling download: {e}")
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Failed to cancel stream: {str(e)}\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
             )
 
@@ -844,14 +700,6 @@ def main():
         
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("engine", engine))
-        application.add_handler(CommandHandler("search", search_torrents))
-        application.add_handler(CommandHandler("status", status))
-        application.add_handler(CommandHandler("pause", pause))
-        application.add_handler(CommandHandler("resume", resume))
-        application.add_handler(CommandHandler("cancel", cancel))
-        application.add_handler(CommandHandler("history", history))
-        application.add_handler(CommandHandler("health", health))
         application.add_handler(MessageHandler(filters.Regex(r'^magnet:\?'), handle_magnet))
         application.add_handler(MessageHandler(filters.Document.FileExtension("torrent"), handle_torrent_file))
         application.add_handler(CallbackQueryHandler(button_callback))
