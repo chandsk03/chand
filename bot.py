@@ -16,6 +16,7 @@ import sys
 import libtorrent as lt
 import aria2p
 import subprocess
+from urllib.parse import urlencode
 
 # Load environment variables
 load_dotenv()
@@ -33,14 +34,16 @@ RATE_LIMIT_REQUESTS = 10
 STALL_TIMEOUT = 300
 ARIA2_RPC_PORT = 6800
 YTS_API_URL = "https://yts.mx/api/v2/list_movies.json"
+TORRENT1337X_API = "https://1337x.to"
 DEFAULT_ENGINE = "aria2c"
+PROGRESS_INTERVAL = 30  # Seconds between progress updates
 
 # Hacker aesthetic
-HACKER_PREFIX = "💾 [CYBERLINK v4.2] "
+HACKER_PREFIX = "💾 [CYBERLINK v4.3] "
 HACKER_FOOTER = "🔒 SECURE TRANSMISSION ENDED"
 ASCII_ART = """
    ╔════════════════════════════════════╗
-   ║  CYBERLINK TORRENT MATRIX v4.2     ║
+   ║  CYBERLINK TORRENT MATRIX v4.3     ║
    ║  INITIALIZING HACKER PROTOCOL...   ║
    ╚════════════════════════════════════╝
 """
@@ -98,13 +101,36 @@ except Exception as e:
 # State
 downloads = []
 download_queue = []
-user_downloads = defaultdict(list)
+user_downloads = defaultdict(list)  # Stores gids for aria2c
 user_requests = defaultdict(list)
-download_start_times = {}
-torrent_names = {}
+download_start_times = {}  # Keyed by gid for aria2c
+torrent_names = {}  # Keyed by gid for aria2c
+download_speeds = {}  # Keyed by gid for speed limits (bytes/s)
 
 # Ensure download directory exists
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+def get_torrent_health(magnet):
+    """Check torrent health (seeders/leechers) using libtorrent."""
+    if not ses:
+        return None
+    try:
+        params = lt.parse_magnet_uri(magnet)
+        h = ses.add_torrent(params)
+        for _ in range(5):  # Wait up to 5 seconds for tracker response
+            status = h.status()
+            if status.num_seeds > 0 or status.num_peers > 0:
+                break
+            time.sleep(1)
+        health = {
+            'seeders': status.num_seeds,
+            'leechers': status.num_peers
+        }
+        ses.remove_torrent(h)
+        return health
+    except Exception as e:
+        logger.error(f"Error checking torrent health: {e}")
+        return None
 
 async def send_file(update: Update, file_path: str, context: ContextTypes.DEFAULT_TYPE):
     """Send file to user if within Telegram's 2GB limit."""
@@ -171,7 +197,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🔍 Search Movies", callback_data="search_movie")],
         [InlineKeyboardButton("📥 Send Magnet/Link", callback_data="send_magnet")],
-        [InlineKeyboardButton("📂 Upload Torrent File", callback_data="upload_torrent")]
+        [InlineKeyboardButton("📂 Upload Torrent File", callback_data="upload_torrent")],
+        [InlineKeyboardButton("📊 View Active Downloads", callback_data="view_downloads")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
@@ -193,13 +220,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{HACKER_PREFIX}CYBERLINK PROTOCOL\n"
         "📟 Use /start to access the main interface.\n"
         "📥 Send magnet links or .torrent files directly.\n"
-        "🔍 Click buttons to search movies or manage downloads.\n"
+        "🔍 Click buttons to search movies, manage downloads, or set speed limits.\n"
         f"{HACKER_FOOTER}",
         parse_mode="Markdown"
     )
 
 async def search_torrents(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str = None):
-    """Handle movie search with inline buttons."""
+    """Handle movie search with inline buttons using YTS and 1337x."""
     await log_ip(update, context)
     if not await rate_limit_check(update.effective_user.id, context):
         return
@@ -210,18 +237,13 @@ async def search_torrents(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
         )
         context.user_data["awaiting_search"] = True
         return
+    keyboard = []
     try:
+        # YTS Search
         response = requests.get(YTS_API_URL, params={"query_term": query, "limit": 5})
         response.raise_for_status()
         data = response.json()
         movies = data.get("data", {}).get("movies", [])
-        if not movies:
-            await update.callback_query.message.reply_text(
-                f"{HACKER_PREFIX}SCAN COMPLETE: No torrents found for '{query}'.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        keyboard = []
         for movie in movies:
             title = movie["title"]
             year = movie["year"]
@@ -230,22 +252,54 @@ async def search_torrents(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
                 magnet = torrent["url"].replace("torrent://", "magnet:?")
                 keyboard.append([
                     InlineKeyboardButton(
-                        f"{title} ({year}, {quality})",
+                        f"YTS: {title} ({year}, {quality})",
                         callback_data=f"magnet_{magnet}"
                     )
                 ])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.callback_query.message.reply_text(
-            f"{HACKER_PREFIX}TORRENT SCAN RESULTS FOR '{query}'\nSelect a stream:\n{HACKER_FOOTER}",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
     except Exception as e:
-        logger.error(f"Error searching torrents for '{query}': {e}")
+        logger.error(f"Error searching YTS for '{query}': {e}")
+
+    try:
+        # 1337x Search
+        response = requests.get(f"{TORRENT1337X_API}/search/{query}/1/")
+        if response.status_code == 200:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(response.text, 'html.parser')
+            torrents = soup.select('table.table-list tr')[:5]
+            for torrent in torrents:
+                title_elem = torrent.select_one('td.name a:nth-of-type(2)')
+                seeds_elem = torrent.select_one('td.seeds')
+                leech_elem = torrent.select_one('td.leeches')
+                if title_elem and seeds_elem and leech_elem:
+                    title = title_elem.text.strip()
+                    magnet_url = f"{TORRENT1337X_API}{title_elem['href']}"
+                    magnet_response = requests.get(magnet_url)
+                    if magnet_response.status_code == 200:
+                        magnet_soup = BeautifulSoup(magnet_response.text, 'html.parser')
+                        magnet_link = magnet_soup.select_one('a[href^="magnet:?"]')
+                        if magnet_link:
+                            magnet = magnet_link['href']
+                            keyboard.append([
+                                InlineKeyboardButton(
+                                    f"1337x: {title} (S:{seeds_elem.text}, L:{leech_elem.text})",
+                                    callback_data=f"magnet_{magnet}"
+                                )
+                            ])
+    except Exception as e:
+        logger.error(f"Error searching 1337x for '{query}': {e}")
+
+    if not keyboard:
         await update.callback_query.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: Torrent scan failed: {str(e)}\n{HACKER_FOOTER}",
+            f"{HACKER_PREFIX}SCAN COMPLETE: No torrents found for '{query}'.\n{HACKER_FOOTER}",
             parse_mode="Markdown"
         )
+        return
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text(
+        f"{HACKER_PREFIX}TORRENT SCAN RESULTS FOR '{query}'\nSelect a stream:\n{HACKER_FOOTER}",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
 
 async def handle_magnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle magnet links."""
@@ -267,7 +321,15 @@ async def handle_magnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-    await start_download(update, context, magnet=magnet)
+    health = get_torrent_health(magnet)
+    health_text = f"Health: {health['seeders']} seeders, {health['leechers']} leechers\n" if health else ""
+    await update.message.reply_text(
+        f"{HACKER_PREFIX}Magnet link received.\n{health_text}Confirm to initiate stream:\n{HACKER_FOOTER}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Start Download", callback_data=f"confirm_magnet_{magnet}")]
+        ]),
+        parse_mode="Markdown"
+    )
 
 async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle .torrent file uploads."""
@@ -313,14 +375,16 @@ async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, mag
                 info = lt.torrent_info(lt.bdecode(torrent_data))
                 params = {'ti': info, 'save_path': DOWNLOAD_DIR}
                 download = ses.add_torrent(params)
+            download_id = id(download)
             downloads.append(download)
-            user_downloads[user_id].append(download)
-            download_start_times[download] = time.time()
+            user_downloads[user_id].append(download_id)
+            download_start_times[download_id] = time.time()
             name = download.name()
-            torrent_names[download] = name
+            torrent_names[download_id] = name
             keyboard = [
-                [InlineKeyboardButton("📊 Progress", callback_data=f"progress_{id(download)}")],
-                [InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{id(download)}")]
+                [InlineKeyboardButton("📊 Progress", callback_data=f"progress_{download_id}")],
+                [InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{download_id}")],
+                [InlineKeyboardButton("⚙️ Speed Limit", callback_data=f"speed_{download_id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
@@ -328,20 +392,22 @@ async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, mag
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
-            await file_selection_prompt(update, context, download, engine)
+            await file_selection_prompt(update, context, download, download_id, engine)
         elif engine == "aria2c" and aria2:
             if magnet:
                 download = aria2.add_magnet(magnet, options={"dir": DOWNLOAD_DIR})
             else:  # torrent_file
                 download = aria2.add_torrent(torrent_file, options={"dir": DOWNLOAD_DIR})
+            download_id = download.gid
             downloads.append(download)
-            user_downloads[user_id].append(download)
-            download_start_times[download] = time.time()
+            user_downloads[user_id].append(download_id)
+            download_start_times[download_id] = time.time()
             name = download.name
-            torrent_names[download] = name
+            torrent_names[download_id] = name
             keyboard = [
-                [InlineKeyboardButton("📊 Progress", callback_data=f"progress_{download.gid}")],
-                [InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{download.gid}")]
+                [InlineKeyboardButton("📊 Progress", callback_data=f"progress_{download_id}")],
+                [InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{download_id}")],
+                [InlineKeyboardButton("⚙️ Speed Limit", callback_data=f"speed_{download_id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
@@ -349,7 +415,7 @@ async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, mag
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
-            await file_selection_prompt(update, context, download, engine)
+            await file_selection_prompt(update, context, download, download_id, engine)
         else:
             await update.message.reply_text(
                 f"{HACKER_PREFIX}ERROR: Download engine unavailable.\n{HACKER_FOOTER}",
@@ -363,8 +429,8 @@ async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, mag
             parse_mode="Markdown"
         )
 
-async def file_selection_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, download, engine):
-    """Prompt user to select files from torrent."""
+async def file_selection_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, download, download_id, engine):
+    """Prompt user to select files from torrent with size info."""
     try:
         if engine == "libtorrent":
             info = download.torrent_info()
@@ -372,13 +438,14 @@ async def file_selection_prompt(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             keyboard = []
             for i, file in enumerate(info.files()):
+                size_mb = file.size / (1024 * 1024)
                 keyboard.append([InlineKeyboardButton(
-                    file.path,
-                    callback_data=f"file_{id(download)}_{i}"
+                    f"{file.path} ({size_mb:.2f} MB)",
+                    callback_data=f"file_{download_id}_{i}"
                 )])
             keyboard.append([InlineKeyboardButton(
                 "Download All",
-                callback_data=f"file_{id(download)}_all"
+                callback_data=f"file_{download_id}_all"
             )])
         else:  # aria2c
             files = download.files
@@ -386,13 +453,14 @@ async def file_selection_prompt(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             keyboard = []
             for i, file in enumerate(files):
+                size_mb = file.length / (1024 * 1024) if file.length else 0
                 keyboard.append([InlineKeyboardButton(
-                    file.path,
-                    callback_data=f"file_{download.gid}_{i}"
+                    f"{file.path} ({size_mb:.2f} MB)",
+                    callback_data=f"file_{download_id}_{i}"
                 )])
             keyboard.append([InlineKeyboardButton(
                 "Download All",
-                callback_data=f"file_{download.gid}_all"
+                callback_data=f"file_{download_id}_all"
             )])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
@@ -427,8 +495,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         context.user_data["awaiting_torrent"] = True
-    elif data[0] == "magnet":
-        magnet = "_".join(data[1:])
+    elif data[0] == "confirm" and data[1] == "magnet":
+        magnet = "_".join(data[2:])
         if len(downloads) >= MAX_CONCURRENT:
             download_queue.append((update, {"magnet": magnet}))
             await query.message.reply_text(
@@ -437,10 +505,47 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await start_download(update, context, magnet=magnet)
+    elif data[0] == "view":
+        keyboard = []
+        for download_id in user_downloads[user_id]:
+            name = torrent_names.get(download_id, "Unknown")
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{name}",
+                    callback_data=f"progress_{download_id}"
+                ),
+                InlineKeyboardButton(
+                    "🛑",
+                    callback_data=f"cancel_{download_id}"
+                )
+            ])
+        if not keyboard:
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}No active streams.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            return
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            f"{HACKER_PREFIX}ACTIVE STREAMS:\n{HACKER_FOOTER}",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    elif data[0] == "magnet":
+        magnet = "_".join(data[1:])
+        health = get_torrent_health(magnet)
+        health_text = f"Health: {health['seeders']} seeders, {health['leechers']} leechers\n" if health else ""
+        await query.message.reply_text(
+            f"{HACKER_PREFIX}Magnet link selected.\n{health_text}Confirm to initiate stream:\n{HACKER_FOOTER}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Start Download", callback_data=f"confirm_magnet_{magnet}")]
+            ]),
+            parse_mode="Markdown"
+        )
     elif data[0] == "file":
         download_id = data[1]
         download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
-        if not download or download_id not in [str(id(d)) if isinstance(d, lt.torrent_handle) else d.gid for d in user_downloads[user_id]]:
+        if not download or download_id not in user_downloads[user_id]:
             await query.message.reply_text(
                 f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
@@ -478,7 +583,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data[0] == "progress":
         download_id = data[1]
         download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
-        if not download or download_id not in [str(id(d)) if isinstance(d, lt.torrent_handle) else d.gid for d in user_downloads[user_id]]:
+        if not download or download_id not in user_downloads[user_id]:
             await query.message.reply_text(
                 f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
@@ -500,7 +605,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:  # aria2c
                 status = download.status()
                 progress = status.completion * 100
-                speed = status.download_rate / 1024
+                speed = status.download_speed / 1024
                 eta = status.eta.total_seconds() if status.eta else float('inf')
                 name = status.name
                 status_text = (
@@ -522,7 +627,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data[0] == "cancel":
         download_id = data[1]
         download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
-        if not download or download_id not in [str(id(d)) if isinstance(d, lt.torrent_handle) else d.gid for d in user_downloads[user_id]]:
+        if not download or download_id not in user_downloads[user_id]:
             await query.message.reply_text(
                 f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
@@ -536,17 +641,64 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 download.remove()
                 engine = "aria2c"
             downloads.remove(download)
-            user_downloads[user_id].remove(download)
-            download_start_times.pop(download, None)
-            torrent_names.pop(download, None)
+            user_downloads[user_id].remove(download_id)
+            download_start_times.pop(download_id, None)
+            torrent_names.pop(download_id, None)
+            download_speeds.pop(download_id, None)
             await query.message.reply_text(
-                f"{HACKER_PREFIX}Stream terminated: {torrent_names.get(download, 'Unknown')} ({engine})\n{HACKER_FOOTER}",
+                f"{HACKER_PREFIX}Stream terminated: {torrent_names.get(download_id, 'Unknown')} ({engine})\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
             )
         except Exception as e:
             logger.error(f"Error cancelling download: {e}")
             await query.message.reply_text(
                 f"{HACKER_PREFIX}ERROR: Failed to cancel stream: {str(e)}\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+    elif data[0] == "speed":
+        download_id = data[1]
+        if download_id not in user_downloads[user_id]:
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            return
+        keyboard = [
+            [InlineKeyboardButton("500 KB/s", callback_data=f"set_speed_{download_id}_500000")],
+            [InlineKeyboardButton("1 MB/s", callback_data=f"set_speed_{download_id}_1000000")],
+            [InlineKeyboardButton("Unlimited", callback_data=f"set_speed_{download_id}_0")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            f"{HACKER_PREFIX}Select speed limit for {torrent_names.get(download_id, 'Unknown')}:\n{HACKER_FOOTER}",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    elif data[0] == "set" and data[1] == "speed":
+        download_id = data[2]
+        speed_limit = int(data[3])
+        download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
+        if not download or download_id not in user_downloads[user_id]:
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            if isinstance(download, lt.torrent_handle):
+                ses.set_download_rate_limit(speed_limit)
+            else:  # aria2c
+                download.update(options={"max-download-limit": str(speed_limit)})
+            download_speeds[download_id] = speed_limit
+            speed_text = "Unlimited" if speed_limit == 0 else f"{speed_limit / 1000} KB/s"
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}Speed limit set to {speed_text} for {torrent_names.get(download_id, 'Unknown')}.\n{HACKER_FOOTER}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Error setting speed limit: {e}")
+            await query.message.reply_text(
+                f"{HACKER_PREFIX}ERROR: Failed to set speed limit: {str(e)}\n{HACKER_FOOTER}",
                 parse_mode="Markdown"
             )
 
@@ -570,18 +722,21 @@ async def process_queue(context: ContextTypes.DEFAULT_TYPE):
                 os.remove(item["torrent_file"])
 
 async def check_downloads(context: ContextTypes.DEFAULT_TYPE):
-    """Check download progress, handle stalls, and send files."""
+    """Check download progress, handle stalls, send files, and push progress updates."""
     global downloads
     completed = []
     stalled = []
     now = time.time()
     for download in downloads:
         try:
+            download_id = id(download) if isinstance(download, lt.torrent_handle) else download.gid
+            if download_id not in download_start_times:
+                continue
             if isinstance(download, lt.torrent_handle):
                 if not download.is_valid():
                     continue
                 status = download.status()
-                if download in download_start_times and (now - download_start_times[download]) > STALL_TIMEOUT:
+                if (now - download_start_times[download_id]) > STALL_TIMEOUT:
                     if status.progress == 0 or status.download_rate == 0:
                         stalled.append(download)
                         continue
@@ -593,10 +748,10 @@ async def check_downloads(context: ContextTypes.DEFAULT_TYPE):
                             continue
                         file_path = os.path.join(DOWNLOAD_DIR, file.path)
                         for user_id, user_dls in user_downloads.items():
-                            if download in user_dls:
+                            if download_id in user_dls:
                                 await context.bot.send_message(
                                     chat_id=user_id,
-                                    text=f"{HACKER_PREFIX}Stream completed: {torrent_names.get(download, 'Unknown')} (libtorrent)\n{HACKER_FOOTER}",
+                                    text=f"{HACKER_PREFIX}Stream completed: {torrent_names.get(download_id, 'Unknown')} (libtorrent)\n{HACKER_FOOTER}",
                                     parse_mode="Markdown"
                                 )
                                 await send_file(
@@ -611,15 +766,33 @@ async def check_downloads(context: ContextTypes.DEFAULT_TYPE):
                                 )
                     ses.remove_torrent(download)
                     for user_id, user_dls in user_downloads.items():
-                        if download in user_dls:
-                            user_downloads[user_id].remove(download)
-                            download_start_times.pop(download, None)
-                            torrent_names.pop(download, None)
+                        if download_id in user_dls:
+                            user_downloads[user_id].remove(download_id)
+                            download_start_times.pop(download_id, None)
+                            torrent_names.pop(download_id, None)
+                            download_speeds.pop(download_id, None)
                             shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+                elif (now - download_start_times[download_id]) % PROGRESS_INTERVAL < 1:
+                    progress = status.progress * 100
+                    speed = status.download_rate / 1024
+                    eta = (status.total_wanted - status.total_wanted_done) / (status.download_rate + 1)
+                    status_text = (
+                        f"📦 {status.name} (libtorrent)\n"
+                        f"  Progress: {progress:.2f}%\n"
+                        f"  Speed: {speed:.2f} KB/s\n"
+                        f"  ETA: {int(eta)} seconds\n"
+                    )
+                    for user_id, user_dls in user_downloads.items():
+                        if download_id in user_dls:
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=f"{HACKER_PREFIX}STREAM UPDATE\n{status_text}{HACKER_FOOTER}",
+                                parse_mode="Markdown"
+                            )
             else:  # aria2c
                 status = download.status()
-                if download in download_start_times and (now - download_start_times[download]) > STALL_TIMEOUT:
-                    if status.completion == 0 or status.download_rate == 0:
+                if (now - download_start_times[download_id]) > STALL_TIMEOUT:
+                    if status.completion == 0 or status.download_speed == 0:
                         stalled.append(download)
                         continue
                 if status.is_complete:
@@ -629,10 +802,10 @@ async def check_downloads(context: ContextTypes.DEFAULT_TYPE):
                             continue
                         file_path = file.path
                         for user_id, user_dls in user_downloads.items():
-                            if download in user_dls:
+                            if download_id in user_dls:
                                 await context.bot.send_message(
                                     chat_id=user_id,
-                                    text=f"{HACKER_PREFIX}Stream completed: {torrent_names.get(download, 'Unknown')} (aria2c)\n{HACKER_FOOTER}",
+                                    text=f"{HACKER_PREFIX}Stream completed: {torrent_names.get(download_id, 'Unknown')} (aria2c)\n{HACKER_FOOTER}",
                                     parse_mode="Markdown"
                                 )
                                 await send_file(
@@ -647,15 +820,34 @@ async def check_downloads(context: ContextTypes.DEFAULT_TYPE):
                                 )
                     download.remove()
                     for user_id, user_dls in user_downloads.items():
-                        if download in user_dls:
-                            user_downloads[user_id].remove(download)
-                            download_start_times.pop(download, None)
-                            torrent_names.pop(download, None)
+                        if download_id in user_dls:
+                            user_downloads[user_id].remove(download_id)
+                            download_start_times.pop(download_id, None)
+                            torrent_names.pop(download_id, None)
+                            download_speeds.pop(download_id, None)
                             shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+                elif (now - download_start_times[download_id]) % PROGRESS_INTERVAL < 1:
+                    progress = status.completion * 100
+                    speed = status.download_speed / 1024
+                    eta = status.eta.total_seconds() if status.eta else float('inf')
+                    status_text = (
+                        f"📦 {status.name} (aria2c)\n"
+                        f"  Progress: {progress:.2f}%\n"
+                        f"  Speed: {speed:.2f} KB/s\n"
+                        f"  ETA: {int(eta)} seconds\n"
+                    )
+                    for user_id, user_dls in user_downloads.items():
+                        if download_id in user_dls:
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=f"{HACKER_PREFIX}STREAM UPDATE\n{status_text}{HACKER_FOOTER}",
+                                parse_mode="Markdown"
+                            )
         except Exception as e:
             logger.error(f"Error checking download: {e}")
     for download in stalled:
         try:
+            download_id = id(download) if isinstance(download, lt.torrent_handle) else download.gid
             if isinstance(download, lt.torrent_handle):
                 ses.remove_torrent(download)
                 engine = "libtorrent"
@@ -663,16 +855,17 @@ async def check_downloads(context: ContextTypes.DEFAULT_TYPE):
                 download.remove()
                 engine = "aria2c"
             for user_id, user_dls in user_downloads.items():
-                if download in user_dls:
+                if download_id in user_dls:
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=f"{HACKER_PREFIX}Stream stalled and terminated: {torrent_names.get(download, 'Unknown')} ({engine})\n{HACKER_FOOTER}",
+                        text=f"{HACKER_PREFIX}Stream stalled and terminated: {torrent_names.get(download_id, 'Unknown')} ({engine})\n{HACKER_FOOTER}",
                         parse_mode="Markdown"
                     )
                     logger.info(f"Cancelled stalled download for user {user_id}")
-                    user_downloads[user_id].remove(download)
-                    download_start_times.pop(download, None)
-                    torrent_names.pop(download, None)
+                    user_downloads[user_id].remove(download_id)
+                    download_start_times.pop(download_id, None)
+                    torrent_names.pop(download_id, None)
+                    download_speeds.pop(download_id, None)
         except Exception as e:
             logger.error(f"Error cancelling stalled download: {e}")
     downloads = [d for d in downloads if d not in completed and d not in stalled]
