@@ -1,913 +1,841 @@
+import asyncio
+import json
 import os
 import logging
-import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from datetime import datetime
-import asyncio
-import re
-import requests
-import shutil
-from collections import defaultdict
-import time
-from dotenv import load_dotenv
-import signal
-import sys
-import libtorrent as lt
-import aria2p
-import subprocess
-from urllib.parse import urlencode
+from telethon import TelegramClient, events
+from telethon.tl.types import User, Channel, Chat
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.custom import Button
+from telethon.errors import (
+    SessionPasswordNeededError, 
+    PhoneCodeInvalidError, 
+    ChatAdminRequiredError, 
+    InviteHashExpiredError, 
+    FloodWaitError,
+    ChannelPrivateError,
+    UsernameNotOccupiedError
+)
 
-# Load environment variables
-load_dotenv()
+CONFIG_DIR = "config"
+MEDIA_DIR = "media"
+def init_dirs():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+init_dirs()
 
-# Configuration
-API_ID = int(os.getenv("API_ID", "25781839"))
-API_HASH = os.getenv("API_HASH", "20a3f2f168739259a180dcdd642e196c")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7614305417:AAFjptKmdgPUN0aeiRSRqNUm2l7KhHj0aFc")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "7584086775").split(",")]
-ARIA2_SECRET = os.getenv("ARIA2_SECRET", "mysecret")
-DOWNLOAD_DIR = "downloads"
-MAX_CONCURRENT = 3
-RATE_LIMIT_SECONDS = 60
-RATE_LIMIT_REQUESTS = 10
-STALL_TIMEOUT = 300
-ARIA2_RPC_PORT = 6800
-YTS_API_URL = "https://yts.mx/api/v2/list_movies.json"
-TORRENT1337X_API = "https://1337x.to"
-DEFAULT_ENGINE = "aria2c"
-PROGRESS_INTERVAL = 30  # Seconds between progress updates
-
-# Hacker aesthetic
-HACKER_PREFIX = "💾 [CYBERLINK v4.3] "
-HACKER_FOOTER = "🔒 SECURE TRANSMISSION ENDED"
-ASCII_ART = """
-   ╔════════════════════════════════════╗
-   ║  CYBERLINK TORRENT MATRIX v4.3     ║
-   ║  INITIALIZING HACKER PROTOCOL...   ║
-   ╚════════════════════════════════════╝
-"""
-
-# Setup logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("bot.log"),
+        logging.FileHandler(os.path.join(CONFIG_DIR, "log.txt")),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
 
-# Initialize libtorrent
-try:
-    settings = {
-        'listen_interfaces': '0.0.0.0:6881',
-        'allow_multiple_connections_per_ip': True,
-        'enable_dht': True,
-        'enable_lsd': True,
-        'enable_upnp': True,
-        'enable_natpmp': True
-    }
-    ses = lt.session(settings)
-except Exception as e:
-    logger.error(f"Failed to initialize libtorrent: {e}")
-    ses = None
+# Configuration
+API_ID = 29637547
+API_HASH = "13e303a526522f741c0680cfc8cd9c00"
+BOT_TOKEN = "7547436649:AAG1CoExVXPpace2NxAs70EZ-aa11jIzG24"
+ADMIN_ID = 6257711894
+SESSION_FILE = os.path.join(CONFIG_DIR, "user_session")
+BOT_SESSION_FILE = os.path.join(CONFIG_DIR, "bot_session")
+TARGETS_FILE = os.path.join(CONFIG_DIR, "targets.json")
+STATS_FILE = os.path.join(CONFIG_DIR, "stats.json")
+IMAGE_PATH = os.path.join(MEDIA_DIR, "bot_image.jpg")
 
-# Initialize aria2c
-try:
-    aria2_process = subprocess.Popen([
-        "aria2c",
-        "--enable-rpc",
-        f"--rpc-listen-port={ARIA2_RPC_PORT}",
-        f"--rpc-secret={ARIA2_SECRET}",
-        f"--dir={DOWNLOAD_DIR}",
-        "--daemon=false",
-        "--quiet"
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    time.sleep(1)
-    aria2 = aria2p.API(
-        aria2p.Client(
-            host="http://localhost",
-            port=ARIA2_RPC_PORT,
-            secret=ARIA2_SECRET
-        )
-    )
-except Exception as e:
-    logger.error(f"Failed to initialize aria2c: {e}")
-    aria2 = None
-    aria2_process = None
+bot = TelegramClient(BOT_SESSION_FILE, API_ID, API_HASH)
+user_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
-# State
-downloads = []
-download_queue = []
-user_downloads = defaultdict(list)  # Stores gids for aria2c
-user_requests = defaultdict(list)
-download_start_times = {}  # Keyed by gid for aria2c
-torrent_names = {}  # Keyed by gid for aria2c
-download_speeds = {}  # Keyed by gid for speed limits (bytes/s)
+is_running = False
+message_counts = {}
+last_warning_time = {}
+target_usernames = {} 
 
-# Ensure download directory exists
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-def get_torrent_health(magnet):
-    """Check torrent health (seeders/leechers) using libtorrent."""
-    if not ses:
-        return None
+def load_targets():
     try:
-        params = lt.parse_magnet_uri(magnet)
-        h = ses.add_torrent(params)
-        for _ in range(5):  # Wait up to 5 seconds for tracker response
-            status = h.status()
-            if status.num_seeds > 0 or status.num_peers > 0:
-                break
-            time.sleep(1)
-        health = {
-            'seeders': status.num_seeds,
-            'leechers': status.num_peers
-        }
-        ses.remove_torrent(h)
-        return health
+        if os.path.exists(TARGETS_FILE):
+            with open(TARGETS_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    global target_usernames
+                    target_usernames = data.get("usernames", {})
+                    return data.get("targets", [])
+                return data
     except Exception as e:
-        logger.error(f"Error checking torrent health: {e}")
-        return None
+        logging.error(f"Error loading targets: {str(e)}")
+        return []
+    return []
 
-async def send_file(update: Update, file_path: str, context: ContextTypes.DEFAULT_TYPE):
-    """Send file to user if within Telegram's 2GB limit."""
+def save_targets(targets):
     try:
-        file_size = os.path.getsize(file_path)
-        if file_size > 2 * 1024 * 1024 * 1024:
-            await update.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: File exceeds 2GB limit.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        with open(file_path, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                caption=f"📽️ {os.path.basename(file_path)}",
-                parse_mode="Markdown"
-            )
-        logger.info(f"Sent file {file_path} to user {update.effective_user.id}")
+        with open(TARGETS_FILE, "w") as f:
+            json.dump({"targets": targets, "usernames": target_usernames}, f)
     except Exception as e:
-        logger.error(f"Error sending file {file_path}: {e}")
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: Failed to send file: {str(e)}\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
+        logging.error(f"Error saving targets: {str(e)}")
 
-async def rate_limit_check(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is within rate limits."""
-    now = time.time()
-    user_requests[user_id] = [t for t in user_requests[user_id] if now - t < RATE_LIMIT_SECONDS]
-    if len(user_requests[user_id]) >= RATE_LIMIT_REQUESTS:
-        logger.warning(f"Rate limit exceeded for user {user_id}")
-        await notify_admins(context, f"User {user_id} exceeded rate limit.")
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"{HACKER_PREFIX}ALERT: Rate limit exceeded. Retry later.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return False
-    user_requests[user_id].append(now)
-    return True
+def load_config():
+    config_file = os.path.join(CONFIG_DIR, "settings.json")
+    default_config = {"message": "Hello! This is an automated message with an image.", "interval": 120}
+    try:
+        if os.path.exists(config_file):
+            with open(config_file, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logging.error(f"Error loading config: {str(e)}")
+        return default_config
+    return default_config
 
-async def notify_admins(context: ContextTypes.DEFAULT_TYPE, message: str):
-    """Notify admins of suspicious activity."""
-    for admin_id in ADMIN_IDS:
+def save_config(config):
+    try:
+        with open(os.path.join(CONFIG_DIR, "settings.json"), "w") as f:
+            json.dump(config, f)
+    except Exception as e:
+        logging.error(f"Error saving config: {str(e)}")
+
+def load_stats():
+    try:
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logging.error(f"Error loading stats: {str(e)}")
+        return {}
+    return {}
+
+def save_stats(stats):
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(stats, f)
+    except Exception as e:
+        logging.error(f"Error saving stats: {str(e)}")
+
+targets = load_targets()
+config = load_config()
+message_counts = load_stats()
+
+settings_buttons = [
+    [Button.inline("Set Image", b"set_image"), Button.inline("Set Message", b"set_message")],
+    [Button.inline("Set Interval", b"set_interval"), Button.inline("Add Target", b"add_target")],
+    [Button.inline("Remove Target", b"remove_target"), Button.inline("View Settings", b"view_settings")],
+    [Button.inline("Start Attack", b"start_bot"), Button.inline("Stop Attack", b"stop_bot")],
+    [Button.inline("Status", b"status"), Button.inline("Validate Targets", b"validate")]
+]
+
+async def get_entity_safe(client, target_input):
+    for attempt in range(3):
         try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"🚨 [ADMIN ALERT] {message}",
-                parse_mode="Markdown"
-            )
+            entity = await client.get_entity(target_input)
+            return entity
+        except (ValueError, ChannelPrivateError, UsernameNotOccupiedError):
+            if attempt == 2:
+                return None
+            await asyncio.sleep(2)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+    return None
+
+async def join_chat_safe(client, target_input):
+    for attempt in range(3):
+        try:
+            if isinstance(target_input, str):
+                if target_input.startswith("https://t.me/"):
+                    target_input = target_input.replace("https://t.me/", "@")
+                if not target_input.startswith("@"):
+                    target_input = f"@{target_input}"
+            await client(JoinChannelRequest(target_input))
+            return True
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except (ChatAdminRequiredError, InviteHashExpiredError, ChannelPrivateError) as e:
+            logging.error(f"Cannot join {target_input}: {str(e)}")
+            return False
         except Exception as e:
-            logger.error(f"Failed to notify admin {admin_id}: {e}")
+            if attempt == 2:
+                logging.error(f"Error joining {target_input}: {str(e)}")
+                return False
+            await asyncio.sleep(2)
+    return False
 
-async def log_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log user IP for security monitoring."""
-    user_id = update.effective_user.id
-    logger.info(f"Action by user {user_id} from IP: Unknown (Telegram API limitation)")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command with inline buttons."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    keyboard = [
-        [InlineKeyboardButton("🔍 Search Movies", callback_data="search_movie")],
-        [InlineKeyboardButton("📥 Send Magnet/Link", callback_data="send_magnet")],
-        [InlineKeyboardButton("📂 Upload Torrent File", callback_data="upload_torrent")],
-        [InlineKeyboardButton("📊 View Active Downloads", callback_data="view_downloads")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        f"```\n{ASCII_ART}\n```\n"
-        f"{HACKER_PREFIX}WELCOME TO CYBERLINK TORRENT MATRIX\n"
-        "🌐 Initiate download protocols with buttons below.\n"
-        f"{HACKER_FOOTER}",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+@bot.on(events.NewMessage(pattern="/start", from_users=ADMIN_ID))
+async def start(event):
+    await event.reply(
+        "Welcome to the Telegram Bot! Use the buttons below to configure settings or send /help for commands.",
+        buttons=settings_buttons
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
-        return
-    await update.message.reply_text(
-        f"```\n{ASCII_ART}\n```\n"
-        f"{HACKER_PREFIX}CYBERLINK PROTOCOL\n"
-        "📟 Use /start to access the main interface.\n"
-        "📥 Send magnet links or .torrent files directly.\n"
-        "🔍 Click buttons to search movies, manage downloads, or set speed limits.\n"
-        f"{HACKER_FOOTER}",
-        parse_mode="Markdown"
+@bot.on(events.NewMessage(pattern="/help", from_users=ADMIN_ID))
+async def help_command(event):
+    help_text = (
+        "Available Commands:\n"
+        "/start - Show main menu\n"
+        "/settings - Show settings menu\n"
+        "/setimage - Set image (attach an image)\n"
+        "/setmessage <text> - Set message text\n"
+        "/setinterval <seconds> - Set send interval (min 30)\n"
+        "/addtarget <@username/link> - Add a target (channel or group)\n"
+        "/removetarget <ID> - Remove a target by ID\n"
+        "/cleartargets - Clear all targets\n"
+        "/startbot - Start target attack\n"
+        "/stopbot - Stop target attack\n"
+        "/status - Show status and message counts\n"
+        "/validate - Validate all targets\n"
+        "/checksetup - Check setup (image, targets, client)\n"
+        "/reset - Reset message counts or session"
+    )
+    await event.reply(help_text)
+
+@bot.on(events.NewMessage(pattern="/settings", from_users=ADMIN_ID))
+async def settings(event):
+    await event.reply(
+        "Configure the bot using the buttons below:",
+        buttons=settings_buttons
     )
 
-async def search_torrents(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str = None):
-    """Handle movie search with inline buttons using YTS and 1337x."""
-    await log_ip(update, context)
-    if not await rate_limit_check(update.effective_user.id, context):
+@bot.on(events.NewMessage(pattern="/setimage", from_users=ADMIN_ID))
+async def set_image(event):
+    if not event.message.photo:
+        await event.reply("Please attach an image with the /setimage command.")
         return
-    if not query:
-        await update.callback_query.message.reply_text(
-            f"{HACKER_PREFIX}Enter a movie title to scan (e.g., 'Matrix').\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        context.user_data["awaiting_search"] = True
-        return
-    keyboard = []
     try:
-        # YTS Search
-        response = requests.get(YTS_API_URL, params={"query_term": query, "limit": 5})
-        response.raise_for_status()
-        data = response.json()
-        movies = data.get("data", {}).get("movies", [])
-        for movie in movies:
-            title = movie["title"]
-            year = movie["year"]
-            for torrent in movie["torrents"]:
-                quality = torrent["quality"]
-                magnet = torrent["url"].replace("torrent://", "magnet:?")
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"YTS: {title} ({year}, {quality})",
-                        callback_data=f"magnet_{magnet}"
-                    )
-                ])
+        await event.message.download_media(file=IMAGE_PATH)
+        await event.reply(f"Image set to {IMAGE_PATH}.")
     except Exception as e:
-        logger.error(f"Error searching YTS for '{query}': {e}")
+        logging.error(f"Error setting image: {str(e)}")
+        await event.reply(f"Failed to set image: {str(e)}")
 
+@bot.on(events.CallbackQuery(data=b"set_image"))
+async def set_image_button(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    await event.reply("Please send an image with the /setimage command.")
+    await event.answer()
+
+@bot.on(events.NewMessage(pattern="/setmessage", from_users=ADMIN_ID))
+async def set_message(event):
     try:
-        # 1337x Search
-        response = requests.get(f"{TORRENT1337X_API}/search/{query}/1/")
-        if response.status_code == 200:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(response.text, 'html.parser')
-            torrents = soup.select('table.table-list tr')[:5]
-            for torrent in torrents:
-                title_elem = torrent.select_one('td.name a:nth-of-type(2)')
-                seeds_elem = torrent.select_one('td.seeds')
-                leech_elem = torrent.select_one('td.leeches')
-                if title_elem and seeds_elem and leech_elem:
-                    title = title_elem.text.strip()
-                    magnet_url = f"{TORRENT1337X_API}{title_elem['href']}"
-                    magnet_response = requests.get(magnet_url)
-                    if magnet_response.status_code == 200:
-                        magnet_soup = BeautifulSoup(magnet_response.text, 'html.parser')
-                        magnet_link = magnet_soup.select_one('a[href^="magnet:?"]')
-                        if magnet_link:
-                            magnet = magnet_link['href']
-                            keyboard.append([
-                                InlineKeyboardButton(
-                                    f"1337x: {title} (S:{seeds_elem.text}, L:{leech_elem.text})",
-                                    callback_data=f"magnet_{magnet}"
-                                )
-                            ])
-    except Exception as e:
-        logger.error(f"Error searching 1337x for '{query}': {e}")
-
-    if not keyboard:
-        await update.callback_query.message.reply_text(
-            f"{HACKER_PREFIX}SCAN COMPLETE: No torrents found for '{query}'.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.message.reply_text(
-        f"{HACKER_PREFIX}TORRENT SCAN RESULTS FOR '{query}'\nSelect a stream:\n{HACKER_FOOTER}",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
-
-async def handle_magnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle magnet links."""
-    await log_ip(update, context)
-    user_id = update.effective_user.id
-    if not await rate_limit_check(user_id, context):
-        return
-    magnet = update.message.text
-    if not re.match(r'^magnet:\?', magnet):
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: Invalid magnet protocol.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    if len(downloads) >= MAX_CONCURRENT:
-        download_queue.append((update, {"magnet": magnet}))
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}Stream queued. Awaiting matrix slot.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        return
-    health = get_torrent_health(magnet)
-    health_text = f"Health: {health['seeders']} seeders, {health['leechers']} leechers\n" if health else ""
-    await update.message.reply_text(
-        f"{HACKER_PREFIX}Magnet link received.\n{health_text}Confirm to initiate stream:\n{HACKER_FOOTER}",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Start Download", callback_data=f"confirm_magnet_{magnet}")]
-        ]),
-        parse_mode="Markdown"
-    )
-
-async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle .torrent file uploads."""
-    await log_ip(update, context)
-    user_id = update.effective_user.id
-    if not await rate_limit_check(user_id, context):
-        return
-    file = await update.message.document.get_file()
-    file_path = os.path.join(DOWNLOAD_DIR, update.message.document.file_name)
-    try:
-        await file.download_to_drive(file_path)
-        if len(downloads) >= MAX_CONCURRENT:
-            download_queue.append((update, {"torrent_file": file_path}))
-            await update.message.reply_text(
-                f"{HACKER_PREFIX}Stream queued. Awaiting matrix slot.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
+        text = event.message.text.split(maxsplit=1)[1] if len(event.message.text.split()) > 1 else None
+        if not text:
+            await event.reply("Please provide a message. Usage: /setmessage Your message here")
             return
-        await start_download(update, context, torrent_file=file_path)
+        config["message"] = text
+        save_config(config)
+        await event.reply(f"Message set to: {text}")
     except Exception as e:
-        logger.error(f"Error processing torrent file for user {user_id}: {e}")
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: Failed to process torrent file: {str(e)}\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        logging.error(f"Error setting message: {str(e)}")
+        await event.reply(f"Failed to set message: {str(e)}")
 
-async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE, magnet=None, torrent_file=None):
-    """Start a torrent download."""
-    user_id = update.effective_user.id
-    engine = DEFAULT_ENGINE
+@bot.on(events.CallbackQuery(data=b"set_message"))
+async def set_message_button(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    await event.reply("Please send the message text with the /setmessage command. Example: /setmessage Hello, this is a test!")
+    await event.answer()
+
+@bot.on(events.NewMessage(pattern="/setinterval", from_users=ADMIN_ID))
+async def set_interval(event):
     try:
-        if engine == "libtorrent" and ses:
-            if magnet:
-                params = lt.parse_magnet_uri(magnet)
-                params.save_path = DOWNLOAD_DIR
-                download = ses.add_torrent(params)
-            else:  # torrent_file
-                with open(torrent_file, 'rb') as f:
-                    torrent_data = f.read()
-                info = lt.torrent_info(lt.bdecode(torrent_data))
-                params = {'ti': info, 'save_path': DOWNLOAD_DIR}
-                download = ses.add_torrent(params)
-            download_id = id(download)
-            downloads.append(download)
-            user_downloads[user_id].append(download_id)
-            download_start_times[download_id] = time.time()
-            name = download.name()
-            torrent_names[download_id] = name
-            keyboard = [
-                [InlineKeyboardButton("📊 Progress", callback_data=f"progress_{download_id}")],
-                [InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{download_id}")],
-                [InlineKeyboardButton("⚙️ Speed Limit", callback_data=f"speed_{download_id}")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                f"{HACKER_PREFIX}Stream initiated: {name} (libtorrent)\n{HACKER_FOOTER}",
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
-            await file_selection_prompt(update, context, download, download_id, engine)
-        elif engine == "aria2c" and aria2:
-            if magnet:
-                download = aria2.add_magnet(magnet, options={"dir": DOWNLOAD_DIR})
-            else:  # torrent_file
-                download = aria2.add_torrent(torrent_file, options={"dir": DOWNLOAD_DIR})
-            download_id = download.gid
-            downloads.append(download)
-            user_downloads[user_id].append(download_id)
-            download_start_times[download_id] = time.time()
-            name = download.name
-            torrent_names[download_id] = name
-            keyboard = [
-                [InlineKeyboardButton("📊 Progress", callback_data=f"progress_{download_id}")],
-                [InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{download_id}")],
-                [InlineKeyboardButton("⚙️ Speed Limit", callback_data=f"speed_{download_id}")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                f"{HACKER_PREFIX}Stream initiated: {name} (aria2c)\n{HACKER_FOOTER}",
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
-            await file_selection_prompt(update, context, download, download_id, engine)
+        interval = int(event.message.text.split(maxsplit=1)[1])
+        if interval < 30:
+            await event.reply("Interval must be at least 30 seconds.")
+            return
+        config["interval"] = interval
+        save_config(config)
+        await event.reply(f"Send interval set to {interval} seconds.")
+    except (IndexError, ValueError):
+        await event.reply("Please provide a valid number. Usage: /setinterval 120")
+    except Exception as e:
+        logging.error(f"Error setting interval: {str(e)}")
+        await event.reply(f"Failed to set interval: {str(e)}")
+
+@bot.on(events.CallbackQuery(data=b"set_interval"))
+async def set_interval_button(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    await event.reply("Please send the interval in seconds with the /setinterval command. Example: /setinterval 120")
+    await event.answer()
+
+@bot.on(events.NewMessage(pattern="/addtarget", from_users=ADMIN_ID))
+async def add_target(event):
+    try:
+        args = event.message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await event.reply("Please provide a username or link. Usage: /addtarget @username or /addtarget https://t.me/link")
+            return
+
+        target_input = args[1].strip()
+        logging.info(f"Attempting to add target: {target_input}")
+
+        if target_input.startswith("https://t.me/"):
+            target_input = target_input.replace("https://t.me/", "@")
+        if not target_input.startswith("@"):
+            target_input = f"@{target_input}"
+
+        async with user_client:
+            entity = await get_entity_safe(user_client, target_input)
+            if not entity:
+                await event.reply(f"Could not find entity: {target_input}")
+                return
+
+            if isinstance(entity, User):
+                await event.reply(f"Cannot add {target_input}: Target must be a channel or group, not a user.")
+                return
+            elif not isinstance(entity, (Channel, Chat)):
+                await event.reply(f"Cannot add {target_input}: Target must be a channel or group.")
+                return
+
+            target_id = entity.id
+            if target_id in targets:
+                await event.reply(f"Target {target_input} is already added.")
+                return
+
+            try:
+                participants = await user_client.get_participants(entity, limit=1)
+                is_member = any(p.id == (await user_client.get_me()).id for p in participants)
+            except Exception:
+                is_member = False
+
+            if not is_member:
+                joined = await join_chat_safe(user_client, target_input)
+                if not joined:
+                    await event.reply(f"Could not join {target_input}")
+                    return
+
+            targets.append(target_id)
+            target_usernames[str(target_id)] = target_input
+            message_counts[str(target_id)] = 0
+            save_targets(targets)
+            save_stats(message_counts)
+            logging.info(f"Successfully added target: {target_input} (ID: {target_id})")
+            await event.reply(f"Added target: {target_input} (ID: {target_id})")
+            
+    except Exception as e:
+        logging.error(f"Error adding target {target_input}: {str(e)}")
+        await event.reply(f"Error adding target: {str(e)}")
+
+@bot.on(events.CallbackQuery(data=b"add_target"))
+async def add_target_button(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    await event.reply("Please send the target username or link with the /addtarget command. Example: /addtarget @username")
+    await event.answer()
+
+@bot.on(events.NewMessage(pattern="/removetarget", from_users=ADMIN_ID))
+async def remove_target(event):
+    try:
+        args = event.message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await event.reply("Please provide a target ID. Usage: /removetarget 123456789")
+            return
+        
+        target_id = int(args[1])
+        if target_id in targets:
+            targets.remove(target_id)
+            target_usernames.pop(str(target_id), None)
+            message_counts.pop(str(target_id), None)
+            save_targets(targets)
+            save_stats(message_counts)
+            await event.reply(f"Removed target ID: {target_id}")
         else:
-            await update.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Download engine unavailable.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
+            await event.reply(f"Target ID {target_id} not found.")
+    except (ValueError, IndexError):
+        await event.reply("Please provide a valid target ID. Usage: /removetarget 123456789")
     except Exception as e:
-        logger.error(f"Error starting download for user {user_id}: {e}")
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: Failed to initiate stream: {str(e)}\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
+        logging.error(f"Error removing target: {str(e)}")
+        await event.reply(f"Failed to remove target: {str(e)}")
 
-async def file_selection_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, download, download_id, engine):
-    """Prompt user to select files from torrent with size info."""
+@bot.on(events.CallbackQuery(data=b"remove_target"))
+async def remove_target_button(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    await event.reply("Please send the target ID to remove with the /removetarget command. Example: /removetarget 123456789")
+    await event.answer()
+
+@bot.on(events.NewMessage(pattern="/cleartargets", from_users=ADMIN_ID))
+async def clear_targets(event):
+    global targets, message_counts, target_usernames
     try:
-        if engine == "libtorrent":
-            info = download.torrent_info()
-            if not info:
-                return
-            keyboard = []
-            for i, file in enumerate(info.files()):
-                size_mb = file.size / (1024 * 1024)
-                keyboard.append([InlineKeyboardButton(
-                    f"{file.path} ({size_mb:.2f} MB)",
-                    callback_data=f"file_{download_id}_{i}"
-                )])
-            keyboard.append([InlineKeyboardButton(
-                "Download All",
-                callback_data=f"file_{download_id}_all"
-            )])
-        else:  # aria2c
-            files = download.files
-            if not files:
-                return
-            keyboard = []
-            for i, file in enumerate(files):
-                size_mb = file.length / (1024 * 1024) if file.length else 0
-                keyboard.append([InlineKeyboardButton(
-                    f"{file.path} ({size_mb:.2f} MB)",
-                    callback_data=f"file_{download_id}_{i}"
-                )])
-            keyboard.append([InlineKeyboardButton(
-                "Download All",
-                callback_data=f"file_{download_id}_all"
-            )])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}Select files to stream:\n{HACKER_FOOTER}",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
+        targets = []
+        message_counts = {}
+        target_usernames = {}
+        save_targets(targets)
+        save_stats(message_counts)
+        await event.reply("All targets and message counts cleared.")
     except Exception as e:
-        logger.error(f"Error creating file selection prompt: {e}")
-        await update.message.reply_text(
-            f"{HACKER_PREFIX}ERROR: Failed to display file selection: {str(e)}\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
+        logging.error(f"Error clearing targets: {str(e)}")
+        await event.reply(f"Failed to clear targets: {str(e)}")
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button callbacks."""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data.split("_")
-    if data[0] == "search":
-        await search_torrents(update, context)
-    elif data[0] == "send":
-        await query.message.reply_text(
-            f"{HACKER_PREFIX}Send a magnet link to initiate stream.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        context.user_data["awaiting_magnet"] = True
-    elif data[0] == "upload":
-        await query.message.reply_text(
-            f"{HACKER_PREFIX}Upload a .torrent file to initiate stream.\n{HACKER_FOOTER}",
-            parse_mode="Markdown"
-        )
-        context.user_data["awaiting_torrent"] = True
-    elif data[0] == "confirm" and data[1] == "magnet":
-        magnet = "_".join(data[2:])
-        if len(downloads) >= MAX_CONCURRENT:
-            download_queue.append((update, {"magnet": magnet}))
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}Stream queued. Awaiting matrix slot.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        await start_download(update, context, magnet=magnet)
-    elif data[0] == "view":
-        keyboard = []
-        for download_id in user_downloads[user_id]:
-            name = torrent_names.get(download_id, "Unknown")
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{name}",
-                    callback_data=f"progress_{download_id}"
-                ),
-                InlineKeyboardButton(
-                    "🛑",
-                    callback_data=f"cancel_{download_id}"
-                )
-            ])
-        if not keyboard:
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}No active streams.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text(
-            f"{HACKER_PREFIX}ACTIVE STREAMS:\n{HACKER_FOOTER}",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
-    elif data[0] == "magnet":
-        magnet = "_".join(data[1:])
-        health = get_torrent_health(magnet)
-        health_text = f"Health: {health['seeders']} seeders, {health['leechers']} leechers\n" if health else ""
-        await query.message.reply_text(
-            f"{HACKER_PREFIX}Magnet link selected.\n{health_text}Confirm to initiate stream:\n{HACKER_FOOTER}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Start Download", callback_data=f"confirm_magnet_{magnet}")]
-            ]),
-            parse_mode="Markdown"
-        )
-    elif data[0] == "file":
-        download_id = data[1]
-        download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
-        if not download or download_id not in user_downloads[user_id]:
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        try:
-            if isinstance(download, lt.torrent_handle):
-                info = download.torrent_info()
-                priorities = [0] * info.num_files()
-                if data[2] == "all":
-                    priorities = [1] * info.num_files()
-                else:
-                    file_index = int(data[2])
-                    priorities[file_index] = 1
-                download.prioritize_files(priorities)
-            else:  # aria2c
-                files = download.files
-                selected = [False] * len(files)
-                if data[2] == "all":
-                    selected = [True] * len(files)
-                else:
-                    file_index = int(data[2])
-                    selected[file_index] = True
-                download.update(options={"select-file": ",".join(str(i + 1) for i, s in enumerate(selected) if s)})
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}File selection updated. Stream active.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Error processing file selection for user {user_id}: {e}")
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Failed to update file selection: {str(e)}\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-    elif data[0] == "progress":
-        download_id = data[1]
-        download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
-        if not download or download_id not in user_downloads[user_id]:
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        try:
-            if isinstance(download, lt.torrent_handle):
-                status = download.status()
-                progress = status.progress * 100
-                speed = status.download_rate / 1024
-                eta = (status.total_wanted - status.total_wanted_done) / (status.download_rate + 1)
-                name = status.name
-                status_text = (
-                    f"📦 {name} (libtorrent)\n"
-                    f"  Progress: {progress:.2f}%\n"
-                    f"  Speed: {speed:.2f} KB/s\n"
-                    f"  ETA: {int(eta)} seconds\n"
-                )
-            else:  # aria2c
-                status = download.status()
-                progress = status.completion * 100
-                speed = status.download_speed / 1024
-                eta = status.eta.total_seconds() if status.eta else float('inf')
-                name = status.name
-                status_text = (
-                    f"📦 {name} (aria2c)\n"
-                    f"  Progress: {progress:.2f}%\n"
-                    f"  Speed: {speed:.2f} KB/s\n"
-                    f"  ETA: {int(eta)} seconds\n"
-                )
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}STREAM STATUS\n{status_text}{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Error checking progress: {e}")
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Failed to check progress: {str(e)}\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-    elif data[0] == "cancel":
-        download_id = data[1]
-        download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
-        if not download or download_id not in user_downloads[user_id]:
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        try:
-            if isinstance(download, lt.torrent_handle):
-                ses.remove_torrent(download)
-                engine = "libtorrent"
-            else:  # aria2c
-                download.remove()
-                engine = "aria2c"
-            downloads.remove(download)
-            user_downloads[user_id].remove(download_id)
-            download_start_times.pop(download_id, None)
-            torrent_names.pop(download_id, None)
-            download_speeds.pop(download_id, None)
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}Stream terminated: {torrent_names.get(download_id, 'Unknown')} ({engine})\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Error cancelling download: {e}")
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Failed to cancel stream: {str(e)}\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-    elif data[0] == "speed":
-        download_id = data[1]
-        if download_id not in user_downloads[user_id]:
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        keyboard = [
-            [InlineKeyboardButton("500 KB/s", callback_data=f"set_speed_{download_id}_500000")],
-            [InlineKeyboardButton("1 MB/s", callback_data=f"set_speed_{download_id}_1000000")],
-            [InlineKeyboardButton("Unlimited", callback_data=f"set_speed_{download_id}_0")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text(
-            f"{HACKER_PREFIX}Select speed limit for {torrent_names.get(download_id, 'Unknown')}:\n{HACKER_FOOTER}",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
-    elif data[0] == "set" and data[1] == "speed":
-        download_id = data[2]
-        speed_limit = int(data[3])
-        download = next((d for d in downloads if (isinstance(d, lt.torrent_handle) and id(d) == int(download_id)) or (hasattr(d, 'gid') and d.gid == download_id)), None)
-        if not download or download_id not in user_downloads[user_id]:
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Stream not found.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-            return
-        try:
-            if isinstance(download, lt.torrent_handle):
-                ses.set_download_rate_limit(speed_limit)
-            else:  # aria2c
-                download.update(options={"max-download-limit": str(speed_limit)})
-            download_speeds[download_id] = speed_limit
-            speed_text = "Unlimited" if speed_limit == 0 else f"{speed_limit / 1000} KB/s"
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}Speed limit set to {speed_text} for {torrent_names.get(download_id, 'Unknown')}.\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Error setting speed limit: {e}")
-            await query.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Failed to set speed limit: {str(e)}\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-
-async def process_queue(context: ContextTypes.DEFAULT_TYPE):
-    """Process queued downloads."""
-    if download_queue and len(downloads) < MAX_CONCURRENT:
-        update, item = download_queue.pop(0)
-        try:
-            if "magnet" in item:
-                await start_download(update, context, magnet=item["magnet"])
-            elif "torrent_file" in item:
-                await start_download(update, context, torrent_file=item["torrent_file"])
-        except Exception as e:
-            logger.error(f"Error processing queued download: {e}")
-            await update.message.reply_text(
-                f"{HACKER_PREFIX}ERROR: Failed to start queued stream: {str(e)}\n{HACKER_FOOTER}",
-                parse_mode="Markdown"
-            )
-        finally:
-            if "torrent_file" in item and os.path.exists(item["torrent_file"]):
-                os.remove(item["torrent_file"])
-
-async def check_downloads(context: ContextTypes.DEFAULT_TYPE):
-    """Check download progress, handle stalls, send files, and push progress updates."""
-    global downloads
-    completed = []
-    stalled = []
-    now = time.time()
-    for download in downloads:
-        try:
-            download_id = id(download) if isinstance(download, lt.torrent_handle) else download.gid
-            if download_id not in download_start_times:
-                continue
-            if isinstance(download, lt.torrent_handle):
-                if not download.is_valid():
+@bot.on(events.NewMessage(pattern="/validate", from_users=ADMIN_ID))
+async def validate_targets(event):
+    if not targets:
+        await event.reply("No targets configured.")
+        return
+    
+    target_details = []
+    async with user_client:
+        for tid in targets[:]:
+            try:
+                chat = await get_entity_safe(user_client, tid)
+                if not chat:
+                    target_details.append(f"Target {tid} ({target_usernames.get(str(tid), 'Unknown')}): Inaccessible (Entity not found)")
                     continue
-                status = download.status()
-                if (now - download_start_times[download_id]) > STALL_TIMEOUT:
-                    if status.progress == 0 or status.download_rate == 0:
-                        stalled.append(download)
-                        continue
-                if status.is_seeding:
-                    completed.append(download)
-                    info = download.torrent_info()
-                    for i, file in enumerate(info.files()):
-                        if download.file_priority(i) == 0:
-                            continue
-                        file_path = os.path.join(DOWNLOAD_DIR, file.path)
-                        for user_id, user_dls in user_downloads.items():
-                            if download_id in user_dls:
-                                await context.bot.send_message(
-                                    chat_id=user_id,
-                                    text=f"{HACKER_PREFIX}Stream completed: {torrent_names.get(download_id, 'Unknown')} (libtorrent)\n{HACKER_FOOTER}",
-                                    parse_mode="Markdown"
-                                )
-                                await send_file(
-                                    Update(0, message=telegram.Message(
-                                        message_id=0,
-                                        chat=telegram.Chat(id=user_id, type='private'),
-                                        date=datetime.now(),
-                                        document=None
-                                    )),
-                                    file_path,
-                                    context
-                                )
-                    ses.remove_torrent(download)
-                    for user_id, user_dls in user_downloads.items():
-                        if download_id in user_dls:
-                            user_downloads[user_id].remove(download_id)
-                            download_start_times.pop(download_id, None)
-                            torrent_names.pop(download_id, None)
-                            download_speeds.pop(download_id, None)
-                            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
-                elif (now - download_start_times[download_id]) % PROGRESS_INTERVAL < 1:
-                    progress = status.progress * 100
-                    speed = status.download_rate / 1024
-                    eta = (status.total_wanted - status.total_wanted_done) / (status.download_rate + 1)
-                    status_text = (
-                        f"📦 {status.name} (libtorrent)\n"
-                        f"  Progress: {progress:.2f}%\n"
-                        f"  Speed: {speed:.2f} KB/s\n"
-                        f"  ETA: {int(eta)} seconds\n"
-                    )
-                    for user_id, user_dls in user_downloads.items():
-                        if download_id in user_dls:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=f"{HACKER_PREFIX}STREAM UPDATE\n{status_text}{HACKER_FOOTER}",
-                                parse_mode="Markdown"
-                            )
-            else:  # aria2c
-                status = download.status()
-                if (now - download_start_times[download_id]) > STALL_TIMEOUT:
-                    if status.completion == 0 or status.download_speed == 0:
-                        stalled.append(download)
-                        continue
-                if status.is_complete:
-                    completed.append(download)
-                    for file in download.files:
-                        if not file.selected:
-                            continue
-                        file_path = file.path
-                        for user_id, user_dls in user_downloads.items():
-                            if download_id in user_dls:
-                                await context.bot.send_message(
-                                    chat_id=user_id,
-                                    text=f"{HACKER_PREFIX}Stream completed: {torrent_names.get(download_id, 'Unknown')} (aria2c)\n{HACKER_FOOTER}",
-                                    parse_mode="Markdown"
-                                )
-                                await send_file(
-                                    Update(0, message=telegram.Message(
-                                        message_id=0,
-                                        chat=telegram.Chat(id=user_id, type='private'),
-                                        date=datetime.now(),
-                                        document=None
-                                    )),
-                                    file_path,
-                                    context
-                                )
-                    download.remove()
-                    for user_id, user_dls in user_downloads.items():
-                        if download_id in user_dls:
-                            user_downloads[user_id].remove(download_id)
-                            download_start_times.pop(download_id, None)
-                            torrent_names.pop(download_id, None)
-                            download_speeds.pop(download_id, None)
-                            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
-                elif (now - download_start_times[download_id]) % PROGRESS_INTERVAL < 1:
-                    progress = status.completion * 100
-                    speed = status.download_speed / 1024
-                    eta = status.eta.total_seconds() if status.eta else float('inf')
-                    status_text = (
-                        f"📦 {status.name} (aria2c)\n"
-                        f"  Progress: {progress:.2f}%\n"
-                        f"  Speed: {speed:.2f} KB/s\n"
-                        f"  ETA: {int(eta)} seconds\n"
-                    )
-                    for user_id, user_dls in user_downloads.items():
-                        if download_id in user_dls:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=f"{HACKER_PREFIX}STREAM UPDATE\n{status_text}{HACKER_FOOTER}",
-                                parse_mode="Markdown"
-                            )
-        except Exception as e:
-            logger.error(f"Error checking download: {e}")
-    for download in stalled:
-        try:
-            download_id = id(download) if isinstance(download, lt.torrent_handle) else download.gid
-            if isinstance(download, lt.torrent_handle):
-                ses.remove_torrent(download)
-                engine = "libtorrent"
-            else:  # aria2c
-                download.remove()
-                engine = "aria2c"
-            for user_id, user_dls in user_downloads.items():
-                if download_id in user_dls:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"{HACKER_PREFIX}Stream stalled and terminated: {torrent_names.get(download_id, 'Unknown')} ({engine})\n{HACKER_FOOTER}",
-                        parse_mode="Markdown"
-                    )
-                    logger.info(f"Cancelled stalled download for user {user_id}")
-                    user_downloads[user_id].remove(download_id)
-                    download_start_times.pop(download_id, None)
-                    torrent_names.pop(download_id, None)
-                    download_speeds.pop(download_id, None)
-        except Exception as e:
-            logger.error(f"Error cancelling stalled download: {e}")
-    downloads = [d for d in downloads if d not in completed and d not in stalled]
+                    
+                chat_title = getattr(chat, 'title', 'Unknown')
+                try:
+                    participants = await user_client.get_participants(chat, limit=1)
+                    is_member = any(p.id == (await user_client.get_me()).id for p in participants)
+                except Exception:
+                    is_member = False
+                    
+                status = "Accessible, Joined" if is_member else "Accessible, Not Joined"
+                target_details.append(f"Target {tid} ({target_usernames.get(str(tid), 'Unknown')} - {chat_title}): {status}")
+                
+                if not is_member:
+                    joined = await join_chat_safe(user_client, tid)
+                    if joined:
+                        target_details[-1] = f"Target {tid} ({target_usernames.get(str(tid), 'Unknown')} - {chat_title}): Accessible, Joined"
+                    else:
+                        targets.remove(tid)
+                        target_usernames.pop(str(tid), None)
+                        message_counts.pop(str(tid), None)
+                        save_targets(targets)
+                        save_stats(message_counts)
+                        await bot.send_message(ADMIN_ID, f"Removed target {tid}: Failed to join")
+                        
+            except Exception as e:
+                logging.error(f"Target {tid} inaccessible: {str(e)}")
+                target_details.append(f"Target {tid} ({target_usernames.get(str(tid), 'Unknown')}): Inaccessible ({str(e)})")
+                targets.remove(tid)
+                target_usernames.pop(str(tid), None)
+                message_counts.pop(str(tid), None)
+                save_targets(targets)
+                save_stats(message_counts)
+                await bot.send_message(ADMIN_ID, f"Removed target {tid}: Inaccessible ({str(e)})")
+    
+    await event.reply("Target Validation:\n" + "\n".join(target_details) if target_details else "No valid targets.")
 
-def signal_handler(sig, frame):
-    """Handle graceful shutdown."""
-    logger.info("Shutting down CYBERLINK matrix...")
-    for download in downloads:
-        try:
-            if isinstance(download, lt.torrent_handle):
-                ses.remove_torrent(download)
-            else:  # aria2c
-                download.remove()
-        except Exception:
-            pass
-    if aria2_process:
-        aria2_process.terminate()
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    sys.exit(0)
+@bot.on(events.CallbackQuery(data=b"validate"))
+async def validate_targets_button(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    await validate_targets(event)
 
-def main():
-    """Start the bot."""
+@bot.on(events.NewMessage(pattern="/checksetup", from_users=ADMIN_ID))
+async def check_setup(event):
     try:
-        application = Application.builder().token(BOT_TOKEN).build()
+        setup_status = []
+        image_status = "Set" if os.path.exists(IMAGE_PATH) else "Not set (use /setimage to set an image)"
+        setup_status.append(f"Image: {image_status}")
+        target_status = f"{len(targets)} configured" if targets else "None configured (use /addtarget)"
+        setup_status.append(f"Targets: {target_status}")
         
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(MessageHandler(filters.Regex(r'^magnet:\?'), handle_magnet))
-        application.add_handler(MessageHandler(filters.Document.FileExtension("torrent"), handle_torrent_file))
-        application.add_handler(CallbackQueryHandler(button_callback))
+        client_status = "Disconnected"
+        try:
+            await user_client.connect()
+            if await user_client.is_user_authorized():
+                client_status = "Connected"
+        except Exception as e:
+            logging.error(f"Error checking client status: {str(e)}")
         
-        application.job_queue.run_repeating(check_downloads, interval=10)
-        application.job_queue.run_repeating(process_queue, interval=5)
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        logger.info("CYBERLINK matrix online.")
-        application.run_polling()
+        setup_status.append(f"User Client: {client_status}")
+        attack_status = f"Running, sending to {len(targets)} targets" if is_running and targets else "Stopped"
+        setup_status.append(f"Target Attack Status: {attack_status}")
+        await event.reply("Setup Status:\n" + "\n".join(setup_status))
     except Exception as e:
-        logger.error(f"Failed to initialize matrix: {e}")
-        sys.exit(1)
+        logging.error(f"Error checking setup: {str(e)}")
+        await event.reply(f"Failed to check setup: {str(e)}")
 
-if __name__ == '__main__':
-    main()
+@bot.on(events.CallbackQuery(data=b"view_settings"))
+async def view_settings(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    try:
+        settings_text = await get_status_text()
+        await event.reply(settings_text)
+    except Exception as e:
+        logging.error(f"Error viewing settings: {str(e)}")
+        await event.reply(f"Failed to view settings: {str(e)}")
+    await event.answer()
+
+@bot.on(events.NewMessage(pattern="/reset", from_users=ADMIN_ID))
+async def reset(event):
+    try:
+        args = event.message.text.split(maxsplit=1)
+        if len(args) < 2 or args[1] not in ["stats", "session"]:
+            await event.reply("Usage: /reset stats (clear message counts) or /reset session (clear session file)")
+            return
+        
+        if args[1] == "stats":
+            global message_counts
+            message_counts = {}
+            save_stats(message_counts)
+            await event.reply("Message counts reset.")
+        elif args[1] == "session":
+            session_file = f"{SESSION_FILE}.session"
+            if os.path.exists(session_file):
+                os.remove(session_file)
+                await event.reply("Session file cleared. Restart the bot to re-authenticate.")
+            else:
+                event.reply("No session file found.")
+    except Exception as e:
+        logging.error(f"Error resetting: {str(e)}")
+        await event.reply(f"Failed to reset: {str(e)}")
+
+@bot.on(events.NewMessage(pattern="/status", from_users=ADMIN_ID))
+async def status(event):
+    try:
+        settings_text = await get_status_text()
+        await event.reply(settings_text)
+    except Exception as e:
+        logging.error(f"Error getting status: {str(e)}")
+        await event.reply(f"Failed to get status: {str(e)}")
+
+@bot.on(events.CallbackQuery(data=b"status"))
+async def status_button(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    try:
+        settings_text = await get_status_text()
+        await event.reply(settings_text)
+    except Exception as e:
+        logging.error(f"Error getting status: {str(e)}")
+        await event.reply(f"Failed to get status: {str(e)}")
+    await event.answer()
+
+async def get_status_text():
+    target_details = []
+    async with user_client:
+        for tid in targets:
+            try:
+                chat = await get_entity_safe(user_client, tid)
+                if not chat:
+                    target_details.append(f"  Target {tid} ({target_usernames.get(str(tid), 'Unknown')}): {message_counts.get(str(tid), 0)} messages, Inaccessible")
+                    continue
+                    
+                chat_title = getattr(chat, 'title', 'Unknown')
+                try:
+                    participants = await user_client.get_participants(chat, limit=1)
+                    is_member = any(p.id == (await user_client.get_me()).id for p in participants)
+                    status = "Joined" if is_member else "Not Joined"
+                except Exception:
+                    status = "Unknown"
+                    
+                count = message_counts.get(str(tid), 0)
+                target_details.append(f"  Target {tid} ({target_usernames.get(str(tid), 'Unknown')} - {chat_title}): {count} messages, {status}")
+            except Exception as e:
+                target_details.append(f"  Target {tid} ({target_usernames.get(str(tid), 'Unknown')}): {message_counts.get(str(tid), 0)} messages, Error: {str(e)}")
+    
+    return (
+        f"Target Attack Status: {'Running, sending to ' + str(len(targets)) + ' targets' if is_running and targets else 'Stopped'}\n"
+        f"Message: {config['message']}\n"
+        f"Interval: {config['interval']} seconds\n"
+        f"Image: {'Set' if os.path.exists(IMAGE_PATH) else 'Not set'}\n"
+        f"Targets: {', '.join(map(str, targets)) if targets else 'None'}\n"
+        f"Messages Sent:\n" + "\n".join(target_details) if target_details else "Messages Sent: None"
+    )
+
+@bot.on(events.NewMessage(pattern="/startbot", from_users=ADMIN_ID))
+async def start_bot(event):
+    global is_running
+    try:
+        if is_running:
+            await event.reply("Target attack is already running.")
+            return
+        
+        is_running = True
+        await event.reply("Target attack started.")
+        
+        if not os.path.exists(IMAGE_PATH):
+            await event.reply("Warning: No image set. Use /setimage to set an image.")
+        if not targets:
+            await event.reply("Warning: No targets configured. Use /addtarget to add targets.")
+    except Exception as e:
+        logging.error(f"Error starting bot: {str(e)}")
+        await event.reply(f"Failed to start bot: {str(e)}")
+
+@bot.on(events.CallbackQuery(data=b"start_bot"))
+async def start_bot_button(event):
+    global is_running
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    
+    try:
+        if is_running:
+            await event.reply("Target attack is already running.")
+        else:
+            is_running = True
+            await event.reply("Target attack started.")
+            if not os.path.exists(IMAGE_PATH):
+                await event.reply("Warning: No image set. Use /setimage to set an image.")
+            if not targets:
+                await event.reply("Warning: No targets configured. Use /addtarget to add targets.")
+    except Exception as e:
+        logging.error(f"Error starting bot: {str(e)}")
+        await event.reply(f"Failed to start bot: {str(e)}")
+    await event.answer()
+
+@bot.on(events.NewMessage(pattern="/stopbot", from_users=ADMIN_ID))
+async def stop_bot(event):
+    global is_running
+    try:
+        if not is_running:
+            await event.reply("Target attack is already stopped.")
+            return
+        
+        is_running = False
+        await event.reply("Target attack stopped.")
+    except Exception as e:
+        logging.error(f"Error stopping bot: {str(e)}")
+        await event.reply(f"Failed to stop bot: {str(e)}")
+
+@bot.on(events.CallbackQuery(data=b"stop_bot"))
+async def stop_bot_button(event):
+    global is_running
+    if event.sender_id != ADMIN_ID:
+        await event.answer("You are not authorized to use this button.")
+        return
+    
+    try:
+        if not is_running:
+            await event.reply("Target attack is already stopped.")
+        else:
+            is_running = False
+            await event.reply("Target attack stopped.")
+    except Exception as e:
+        logging.error(f"Error stopping bot: {str(e)}")
+        await event.reply(f"Failed to start bot: {str(e)}")
+    await event.answer()
+
+async def send_messages():
+    WARNING_INTERVAL = 300  # 5 minutes between warnings
+    while True:
+        try:
+            if not is_running:
+                await asyncio.sleep(5)
+                continue
+            
+            if not targets:
+                current_time = datetime.now().timestamp()
+                if current_time - last_warning_time.get('no_targets', 0) > WARNING_INTERVAL:
+                    last_warning_time['no_targets'] = current_time
+                    await bot.send_message(ADMIN_ID, "No targets configured. Use /addtarget to add targets.")
+                await asyncio.sleep(config["interval"])
+                continue
+            
+            if not os.path.exists(IMAGE_PATH):
+                current_time = datetime.now().timestamp()
+                if current_time - last_warning_time.get('no_image', 0) > WARNING_INTERVAL:
+                    last_warning_time['no_image'] = current_time
+                    await bot.send_message(ADMIN_ID, "Image not set. Use /setimage to set an image.")
+                await asyncio.sleep(config["interval"])
+                continue
+
+            try:
+                await user_client.connect()
+                if not await user_client.is_user_authorized():
+                    logging.error("User client not authorized")
+                    await bot.send_message(ADMIN_ID, "User client not authorized. Please reset session with /reset session")
+                    await asyncio.sleep(config["interval"])
+                    continue
+            except Exception as e:
+                logging.error(f"Error connecting user client: {str(e)}")
+                await asyncio.sleep(10)
+                continue
+
+            for target_id in targets[:]:
+                try:
+                    chat = await get_entity_safe(user_client, target_id)
+                    if not chat:
+                        targets.remove(target_id)
+                        target_usernames.pop(str(target_id), None)
+                        message_counts.pop(str(target_id), None)
+                        save_targets(targets)
+                        save_stats(message_counts)
+                        await bot.send_message(ADMIN_ID, f"Removed target {target_id}: Inaccessible")
+                        continue
+                        
+                    try:
+                        participants = await user_client.get_participants(chat, limit=1)
+                        is_member = any(p.id == (await user_client.get_me()).id for p in participants)
+                    except Exception:
+                        is_member = False
+                        
+                    if not is_member:
+                        joined = await join_chat_safe(user_client, target_id)
+                        if not joined:
+                            targets.remove(target_id)
+                            target_usernames.pop(str(target_id), None)
+                            message_counts.pop(str(target_id), None)
+                            save_targets(targets)
+                            save_stats(message_counts)
+                            await bot.send_message(ADMIN_ID, f"Removed target {target_id}: Failed to join")
+                            continue
+
+                    message_number = message_counts.get(str(target_id), 0) + 1
+                    unique_id = f"{target_id}-{message_number}"
+
+                    for attempt in range(2):
+                        try:
+                            await user_client.send_file(
+                                target_id,
+                                file=IMAGE_PATH,
+                                caption=config['message']
+                            )
+                            message_counts[str(target_id)] = message_number
+                            save_stats(message_counts)
+                            logging.info(f"Sent message #{message_number} (ID: {unique_id}) to {target_id} ({target_usernames.get(str(target_id), 'Unknown')})")
+                            break
+                        except FloodWaitError as e:
+                            logging.warning(f"Flood wait for {e.seconds} seconds for target {target_id}")
+                            await asyncio.sleep(e.seconds)
+                        except Exception as e:
+                            if attempt == 1:
+                                logging.error(f"Error sending to {target_id} ({target_usernames.get(str(target_id), 'Unknown')}): {str(e)}")
+                                break
+                            await asyncio.sleep(5)
+                                
+                except FloodWaitError as e:
+                    logging.warning(f"Flood wait for {e.seconds} seconds for target {target_id}")
+                    await asyncio.sleep(e.seconds)
+                except (ChatAdminRequiredError, InviteHashExpiredError) as e:
+                    targets.remove(target_id)
+                    target_usernames.pop(str(target_id), None)
+                    message_counts.pop(str(target_id), None)
+                    save_targets(targets)
+                    save_stats(message_counts)
+                    await bot.send_message(ADMIN_ID, f"Removed target {target_id}: {str(e)}")
+                except Exception as e:
+                    logging.error(f"Error processing target {target_id} ({target_usernames.get(str(target_id), 'Unknown')}): {str(e)}")
+            
+            await asyncio.sleep(config["interval"])
+            
+        except Exception as e:
+            logging.error(f"Error in send_messages loop: {str(e)}")
+            await asyncio.sleep(10)
+
+async def authenticate_client():
+    session_file = f"{SESSION_FILE}.session"
+    if os.path.exists(session_file):
+        try:
+            await user_client.connect()
+            if await user_client.is_user_authorized():
+                logging.info("User client started with existing session.")
+                return
+        except Exception as e:
+            logging.error(f"Failed to start user client with existing session: {str(e)}")
+            os.remove(session_file)
+
+    phone = input("Please enter your phone (or bot token): ")
+    try:
+        await user_client.start(
+            phone=lambda: phone,
+            code=lambda: input("Please enter the code you received: "),
+            password=lambda: input("Please enter your password (if 2FA is enabled): ") if user_client.is_user_authorized() else None
+        )
+        logging.info("User client authenticated successfully.")
+    except PhoneCodeInvalidError:
+        logging.error("Invalid code provided. Please try again.")
+        if os.path.exists(session_file):
+            os.remove(session_file)
+        raise
+    except SessionPasswordNeededError:
+        logging.error("Two-factor authentication required. Please provide the password.")
+        raise
+    except Exception as e:
+        logging.error(f"Authentication failed: {str(e)}")
+        raise
+
+async def heartbeat():
+    while True:
+        try:
+            logging.info("Bot is running...")
+            await asyncio.sleep(300)
+        except Exception as e:
+            logging.error(f"Error in heartbeat: {str(e)}")
+            await asyncio.sleep(60)
+
+async def main():
+    global is_running
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    
+    try:
+        await bot.start(bot_token=BOT_TOKEN)
+        logging.info("Bot started with session file: %s.session", BOT_SESSION_FILE)
+    except Exception as e:
+        logging.error(f"Failed to start bot: {str(e)}")
+        raise
+
+    try:
+        await authenticate_client()
+    except Exception as e:
+        logging.error(f"Authentication error: {str(e)}")
+        raise
+
+    is_running = True
+    logging.info("Target attack started by default.")
+    
+    try:
+        if not os.path.exists(IMAGE_PATH):
+            last_warning_time['no_image'] = datetime.now().timestamp()
+            await bot.send_message(ADMIN_ID, "Warning: No image set. Use /setimage to set an image.")
+        if not targets:
+            last_warning_time['no_targets'] = datetime.now().timestamp()
+            await bot.send_message(ADMIN_ID, "Warning: No targets configured. Use /addtarget to add targets.")
+    except Exception as e:
+        logging.error(f"Error sending initial warnings: {str(e)}")
+
+    try:
+        tasks = [
+            send_messages(),
+            heartbeat(),
+            bot.run_until_disconnected()
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        logging.error(f"Error in main loop: {str(e)}")
+        raise
+
+async def shutdown():
+    global is_running
+    is_running = False
+    try:
+        if bot.is_connected():
+            await bot.disconnect()
+            logging.info("Bot disconnected")
+    except Exception as e:
+        logging.error(f"Error disconnecting bot: {str(e)}")
+    try:
+        if user_client.is_connected():
+            await user_client.disconnect()
+            logging.info("User client disconnected")
+    except Exception as e:
+        logging.error(f"Error disconnecting user client: {str(e)}")
+
+if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logging.info("Shutting down due to manual interruption (Ctrl+C)...")
+        loop.run_until_complete(shutdown())
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        loop.run_until_complete(shutdown())
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        logging.info("Event loop closed.")
