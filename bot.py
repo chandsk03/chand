@@ -40,7 +40,7 @@ logging.basicConfig(
 API_ID = 29637547
 API_HASH = "13e303a526522f741c0680cfc8cd9c00"
 BOT_TOKEN = "7547436649:AAG1CoExVXPpace2NxAs70EZ-aa11jIzG24"
-ADMIN_ID = 6257711894  # Update this to a valid admin ID
+ADMIN_ID = 6257711894
 SESSION_FILE = os.path.join(CONFIG_DIR, "user_session")
 BOT_SESSION_FILE = os.path.join(CONFIG_DIR, "bot_session")
 TARGETS_FILE = os.path.join(CONFIG_DIR, "targets.json")
@@ -761,33 +761,33 @@ async def authenticate_client():
     session_file = f"{SESSION_FILE}.session"
     is_interactive = sys.stdin.isatty()
 
+    # Check if session exists and is valid
     if os.path.exists(session_file):
         try:
             await user_client.connect()
             if await user_client.is_user_authorized():
                 logging.info("User client started with existing session.")
                 return True
+            else:
+                logging.warning("Session exists but not authorized. Removing session file.")
+                os.remove(session_file)
         except Exception as e:
             logging.error(f"Failed to start user client with existing session: {str(e)}")
             os.remove(session_file)
 
+    # Non-interactive environment (e.g., systemd)
     if not is_interactive:
         if credentials.get("phone"):
             try:
-                phone = credentials["phone"]
-                code = credentials.get("code")
-                password = credentials.get("password")
-
                 async def phone_callback():
-                    return phone
+                    return credentials["phone"]
 
                 async def code_callback():
-                    if code:
-                        return code
-                    raise Exception("No code provided in credentials for non-interactive environment")
+                    # Code must be provided interactively or via external means
+                    raise Exception("Authentication code required. Please run interactively to provide the code.")
 
                 async def password_callback():
-                    return password if password else None
+                    return credentials.get("password")
 
                 await user_client.start(
                     phone=phone_callback,
@@ -797,10 +797,10 @@ async def authenticate_client():
                 logging.info("User client authenticated using stored credentials.")
                 return True
             except Exception as e:
-                logging.error(f"Authentication failed using stored credentials: {str(e)}")
+                logging.error(f"Authentication failed in non-interactive mode: {str(e)}")
                 return False
         else:
-            logging.error("No credentials provided for non-interactive environment. Please run interactively first or set credentials in config/credentials.json.")
+            logging.error("No credentials found in config/credentials.json. Please run interactively to authenticate first.")
             return False
 
     # Interactive authentication
@@ -818,10 +818,9 @@ async def authenticate_client():
             return input().strip()
 
         async def password_callback():
-            if await user_client.is_user_authorized():
-                print("Please enter your password (if 2FA is enabled): ", end="")
-                return input().strip()
-            return None
+            print("Please enter your password (if 2FA is enabled, or press Enter to skip): ", end="")
+            password = input().strip()
+            return password if password else None
 
         await user_client.start(
             phone=phone_callback,
@@ -832,6 +831,7 @@ async def authenticate_client():
 
         # Save credentials
         credentials["phone"] = phone
+        credentials.pop("code", None)  # Do not store code
         save_credentials(credentials)
         return True
     except PhoneCodeInvalidError:
@@ -840,7 +840,7 @@ async def authenticate_client():
             os.remove(session_file)
         return False
     except SessionPasswordNeededError:
-        logging.error("Two-factor authentication required. Please provide the password.")
+        logging.error("Two-factor authentication required. Please provide the correct password.")
         return False
     except Exception as e:
         logging.error(f"Authentication failed: {str(e)}")
