@@ -26,6 +26,9 @@ from telethon.errors import (
 import psutil
 from logging.handlers import RotatingFileHandler
 import getpass
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Constants
 MIN_MESSAGE_INTERVAL = 30
